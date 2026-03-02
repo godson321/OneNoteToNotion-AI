@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "WebSearch",
+      "Bash(command:*)",
+      "Bash(specify init:*)",
+      "Bash(mkdir:*)",
+      "Bash(bash:*)",
+      "Bash(cp:*)",
+      "Bash(dotnet build:*)",
+      "Bash(git clone:*)",
+      "Bash(powershell:*)",
+      "Bash(node:*)",
+      "Bash(git:*)",
+      "Bash(\"/c/Program Files/dotnet/dotnet\" build:*)"
+    ]
+  }
+}

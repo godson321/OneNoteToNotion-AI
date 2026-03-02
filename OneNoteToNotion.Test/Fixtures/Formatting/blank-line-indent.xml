@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<one:Page xmlns:one="http://schemas.microsoft.com/office/onenote/2013/onenote"
+         ID="{A1234567-1234-1234-1234-123456789ABC}{1}{B0}"
+         name="空行缩进测试"
+         dateTime="2026-02-28T10:00:00.000Z"
+         lastModifiedTime="2026-02-28T10:00:00.000Z"
+         pageLevel="0"
+         lang="zh-CN">
+  <one:QuickStyleDef index="0" name="PageTitle" fontColor="automatic" highlightColor="automatic" font="Segoe UI" fontSize="20.0" spaceBefore="0.0" spaceAfter="0.0"/>
+  <one:QuickStyleDef index="1" name="p" fontColor="automatic" highlightColor="automatic" font="Segoe UI" fontSize="11.0" spaceBefore="0.0" spaceAfter="0.0"/>
+  <one:Outline>
+    <one:OEChildren>
+      <one:OE alignment="left" quickStyleIndex="1">
+        <one:T><![CDATA[<span>第一行</span><br/><br/><span>第三行</span>]]></one:T>
+      </one:OE>
+      <one:OE alignment="left" quickStyleIndex="1">
+        <one:T><![CDATA[<span>    缩进四空格</span>]]></one:T>
+      </one:OE>
+      <one:OE alignment="left" quickStyleIndex="1">
+        <one:T><![CDATA[<span>	Tab缩进</span>]]></one:T>
+      </one:OE>
+      <one:OE alignment="left" quickStyleIndex="1">
+        <one:T><![CDATA[<span></span>]]></one:T>
+      </one:OE>
+    </one:OEChildren>
+  </one:Outline>
+</one:Page>

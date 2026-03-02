@@ -1,0 +1,31 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36908.2
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OneNoteToNotion", "OneNoteToNotion\OneNoteToNotion.csproj", "{1F687690-9A89-A836-44E2-5541775C28D6}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OneNoteToNotion.Test", "OneNoteToNotion.Test\OneNoteToNotion.Test.csproj", "{2537AE5A-9686-8171-D884-4C43DCF145A1}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{1F687690-9A89-A836-44E2-5541775C28D6}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1F687690-9A89-A836-44E2-5541775C28D6}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1F687690-9A89-A836-44E2-5541775C28D6}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1F687690-9A89-A836-44E2-5541775C28D6}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2537AE5A-9686-8171-D884-4C43DCF145A1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2537AE5A-9686-8171-D884-4C43DCF145A1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2537AE5A-9686-8171-D884-4C43DCF145A1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2537AE5A-9686-8171-D884-4C43DCF145A1}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {63CEEB78-29A6-44EF-AF1E-58AE007C972F}
+	EndGlobalSection
+EndGlobal
