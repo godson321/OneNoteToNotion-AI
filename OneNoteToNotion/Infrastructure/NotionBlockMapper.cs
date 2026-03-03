@@ -128,7 +128,8 @@ public sealed class NotionBlockMapper : INotionBlockMapper
                     break;
                 case ImageBlock image:
                 {
-                    if (!string.IsNullOrWhiteSpace(image.ProcessingError))
+                    if (!string.IsNullOrWhiteSpace(image.ProcessingError) &&
+                        !IsExpectedGdiFallbackWarning(image.ProcessingError))
                     {
                         DiagnosticLogger.Warn(
                             $"图片处理告警: format={image.OriginalFormat}, originalSize={image.OriginalSize}, finalSize={image.FinalSize}, detail={image.ProcessingError}");
@@ -256,10 +257,10 @@ public sealed class NotionBlockMapper : INotionBlockMapper
         var children = rows
             .Skip(startIndex)
             .Take(count)
-            .Select((row, rowIndex) => new
+            .Select((row, rowIndex) => new NotionBlockInput
             {
-                type = "table_row",
-                table_row = new
+                Type = "table_row",
+                Value = new
                 {
                     cells = row
                         .Select(cellRuns =>
@@ -289,9 +290,9 @@ public sealed class NotionBlockMapper : INotionBlockMapper
             {
                 table_width = tableWidth,
                 has_column_header = hasHeader,
-                has_row_header = false,
-                children
-            }
+                has_row_header = false
+            },
+            Children = children
         };
     }
 
@@ -464,5 +465,11 @@ public sealed class NotionBlockMapper : INotionBlockMapper
         }
 
         return (base64Data, format);
+    }
+
+    private static bool IsExpectedGdiFallbackWarning(string processingError)
+    {
+        return processingError.Contains("GDI+处理失败", StringComparison.OrdinalIgnoreCase)
+               || processingError.Contains("A generic error occurred in GDI+", StringComparison.OrdinalIgnoreCase);
     }
 }

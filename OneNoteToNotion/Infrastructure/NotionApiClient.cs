@@ -1,7 +1,6 @@
 ﻿using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using OneNoteToNotion.Notion;
 
 namespace OneNoteToNotion.Infrastructure;
@@ -686,12 +685,11 @@ public sealed class NotionApiClient : INotionApiClient
 
     private static object ToBlockObject(NotionBlockInput block)
     {
-        object blockValue = block.Value;
         var payload = new Dictionary<string, object>
         {
             ["object"] = "block",
             ["type"] = block.Type,
-            [block.Type] = blockValue
+            [block.Type] = block.Value
         };
 
         if (block.Children.Count > 0)
@@ -699,8 +697,9 @@ public sealed class NotionApiClient : INotionApiClient
             if (SupportsChildren(block.Type))
             {
                 var childBlocks = block.Children.Select(ToBlockObject).ToList();
-                blockValue = InjectChildrenIntoTypeValue(block.Value, childBlocks);
-                payload[block.Type] = blockValue;
+                // Notion requires nested blocks in top-level `children`,
+                // not inside the type payload (e.g. `paragraph.children` is invalid).
+                payload["children"] = childBlocks;
             }
             else
             {
@@ -720,15 +719,9 @@ public sealed class NotionApiClient : INotionApiClient
                or "toggle"
                or "quote"
                or "callout"
+               or "table"
                or "synced_block"
                or "template";
-    }
-
-    private static object InjectChildrenIntoTypeValue(object typeValue, IReadOnlyList<object> children)
-    {
-        var node = JsonNode.Parse(JsonSerializer.Serialize(typeValue)) as JsonObject ?? new JsonObject();
-        node["children"] = JsonSerializer.SerializeToNode(children);
-        return node;
     }
 
     private static string? TryGetString(JsonElement element, string propertyName)

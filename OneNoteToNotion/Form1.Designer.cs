@@ -36,6 +36,9 @@ partial class Form1
         toolStripBulkArchive = new ToolStripButton();
         toolStripBulkMove = new ToolStripButton();
         toolStripOpenNotion = new ToolStripButton();
+        toolStripHistory = new ToolStripButton();
+        toolStripExportMd = new ToolStripButton();
+        toolStripSeparator1 = new ToolStripSeparator();
         splitContainerMain = new SplitContainer();
         treeViewOneNote = new TreeView();
         panelRight = new Panel();
@@ -69,7 +72,7 @@ partial class Form1
         // toolStripTop
         // 
         toolStripTop.ImageScalingSize = new Size(20, 20);
-        toolStripTop.Items.AddRange(new ToolStripItem[] { toolStripReload, toolStripSync, toolStripCancel, toolStripBulkArchive, toolStripBulkMove, toolStripOpenNotion });
+        toolStripTop.Items.AddRange(new ToolStripItem[] { toolStripReload, toolStripSync, toolStripCancel, toolStripBulkArchive, toolStripBulkMove, toolStripOpenNotion, toolStripHistory, toolStripSeparator1, toolStripExportMd });
         toolStripTop.Location = new Point(0, 0);
         toolStripTop.Name = "toolStripTop";
         toolStripTop.Size = new Size(1422, 27);
@@ -123,6 +126,27 @@ partial class Form1
         toolStripOpenNotion.Size = new Size(74, 24);
         toolStripOpenNotion.Text = "打开Notion";
         toolStripOpenNotion.Click += ToolStripButtonOpenNotion_Click;
+        // 
+        // toolStripHistory
+        // 
+        toolStripHistory.DisplayStyle = ToolStripItemDisplayStyle.Text;
+        toolStripHistory.Name = "toolStripHistory";
+        toolStripHistory.Size = new Size(74, 24);
+        toolStripHistory.Text = "历史记录";
+        toolStripHistory.Click += ToolStripButtonHistory_Click;
+        // 
+        // toolStripSeparator1
+        // 
+        toolStripSeparator1.Name = "toolStripSeparator1";
+        toolStripSeparator1.Size = new Size(6, 27);
+        // 
+        // toolStripExportMd
+        // 
+        toolStripExportMd.DisplayStyle = ToolStripItemDisplayStyle.Text;
+        toolStripExportMd.Name = "toolStripExportMd";
+        toolStripExportMd.Size = new Size(74, 24);
+        toolStripExportMd.Text = "导出MD";
+        toolStripExportMd.Click += ToolStripButtonExportMd_Click;
         // 
         // splitContainerMain
         // 
@@ -347,6 +371,9 @@ partial class Form1
     private ToolStripButton toolStripBulkArchive;
     private ToolStripButton toolStripBulkMove;
     private ToolStripButton toolStripOpenNotion;
+    private ToolStripButton toolStripHistory;
+    private ToolStripButton toolStripExportMd;
+    private ToolStripSeparator toolStripSeparator1;
     private SplitContainer splitContainerMain;
     private TreeView treeViewOneNote;
     private Panel panelConfig;

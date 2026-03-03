@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using OneNoteToNotion.Application;
@@ -14,22 +14,33 @@ public partial class Form1 : Form
     private static readonly string ConfigFilePath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "OneNoteToNotion", "config.json");
+    private static readonly string SyncHistoryFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "OneNoteToNotion", "sync-history.json");
+    private const int MaxSyncHistoryRecords = 100;
 
     private readonly IOneNoteHierarchyProvider _hierarchyProvider;
+    private readonly IOneNotePageContentProvider _pageContentProvider;
     private readonly NotionSyncOrchestrator _syncOrchestrator;
     private readonly NotionApiClient _notionApiClient;
+    private readonly MarkdownExporter _markdownExporter;
     private readonly Dictionary<string, string> _lastSyncedPageMap = new();
+    private readonly List<SyncHistoryRecord> _syncHistory = new();
 
     private CancellationTokenSource? _syncCts;
+    private CancellationTokenSource? _exportCts;
     private bool _webViewReady;
 
     public Form1(IOneNoteHierarchyProvider hierarchyProvider, NotionSyncOrchestrator syncOrchestrator, NotionApiClient notionApiClient)
     {
         _hierarchyProvider = hierarchyProvider;
+        _pageContentProvider = (IOneNotePageContentProvider)hierarchyProvider;
         _syncOrchestrator = syncOrchestrator;
         _notionApiClient = notionApiClient;
+        _markdownExporter = new MarkdownExporter(_pageContentProvider);
         InitializeComponent();
         LoadConfig();
+        LoadSyncHistory();
 
         DiagnosticLogger.Info("Form1 构造完成");
     }
@@ -93,12 +104,152 @@ public partial class Form1 : Form
     private void ToolStripButtonCancel_Click(object sender, EventArgs e)
     {
         _syncCts?.Cancel();
+        _exportCts?.Cancel();
         toolStripCancel.Enabled = false;
         toolStripStatusLabel.Text = "正在取消...";
     }
 
+    private async void ToolStripButtonExportMd_Click(object sender, EventArgs e)
+    {
+        var checkedNodes = GetCheckedNodes(treeViewOneNote.Nodes);
+        if (checkedNodes.Count == 0)
+        {
+            MessageBox.Show("请先勾选需要导出的节点。");
+            return;
+        }
+
+        using var folderDialog = new FolderBrowserDialog
+        {
+            Description = "选择 Markdown 导出目录",
+            UseDescriptionForTitle = true
+        };
+
+        if (folderDialog.ShowDialog() != DialogResult.OK)
+        {
+            return;
+        }
+
+        var outputPath = folderDialog.SelectedPath;
+        await RunExportAsync(checkedNodes, outputPath);
+    }
+
+    private async Task RunExportAsync(List<OneNoteTreeNode> nodes, string outputPath)
+    {
+        var startedAt = DateTime.Now;
+        var totalNodes = MarkdownExporter.CountAllNodes(nodes);
+
+        toolStripProgressBar.Style = ProgressBarStyle.Blocks;
+        toolStripProgressBar.Minimum = 0;
+        toolStripProgressBar.Maximum = totalNodes;
+        toolStripProgressBar.Value = 0;
+        toolStripStatusLabel.Text = $"正在导出... 0/{totalNodes}";
+        SetToolbarEnabled(false);
+        toolStripCancel.Enabled = true;
+
+        _exportCts = new CancellationTokenSource();
+        var ct = _exportCts.Token;
+
+        var progress = new Progress<ExportProgress>(p =>
+        {
+            toolStripProgressBar.Value = Math.Min(p.Current, totalNodes);
+            toolStripStatusLabel.Text = $"正在导出「{p.CurrentNodeName}」 {p.Current}/{p.Total}";
+        });
+
+        try
+        {
+            // 在后台线程执行导出，避免阻塞 WinForms UI 消息循环（导出期间窗口可拖动）。
+            var result = await Task.Run(
+                () => _markdownExporter.ExportAsync(nodes, outputPath, progress, ct));
+
+            if (result.WasCanceled)
+            {
+                toolStripStatusLabel.Text = "导出已取消";
+                RecordSyncHistory(
+                    operation: "export-md",
+                    status: "canceled",
+                    options: null,
+                    startedAt: startedAt,
+                    finishedAt: DateTime.Now,
+                    summary: "导出已取消",
+                    result: null);
+            }
+            else if (result.IsSuccess)
+            {
+                var summary = $"导出完成：成功 {result.ExportedFiles} 个文件";
+                toolStripStatusLabel.Text = summary;
+                toolStripProgressBar.Value = totalNodes;
+                RecordSyncHistory(
+                    operation: "export-md",
+                    status: "success",
+                    options: null,
+                    startedAt: startedAt,
+                    finishedAt: DateTime.Now,
+                    summary: summary,
+                    result: null);
+
+                // 询问是否打开导出目录
+                var openResult = MessageBox.Show(
+                    $"导出完成！\n共导出 {result.ExportedFiles} 个 Markdown 文件。\n\n是否打开导出目录？",
+                    "导出完成",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Information);
+
+                if (openResult == DialogResult.Yes)
+                {
+                    Process.Start("explorer.exe", outputPath);
+                }
+            }
+            else
+            {
+                var summary = $"导出完成：成功 {result.ExportedFiles} 个，失败 {result.FailedNodes.Count} 个";
+                toolStripStatusLabel.Text = summary;
+                toolStripProgressBar.Value = totalNodes;
+                RecordSyncHistory(
+                    operation: "export-md",
+                    status: "partial",
+                    options: null,
+                    startedAt: startedAt,
+                    finishedAt: DateTime.Now,
+                    summary: summary,
+                    result: null);
+
+                // 显示失败的节点
+                var failedList = string.Join("\n", result.FailedNodes.Select(f => $"• {f.Node.Name}: {f.Error}"));
+                MessageBox.Show(
+                    $"导出完成，但有部分失败：\n\n{failedList}",
+                    "导出部分失败",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+        }
+        catch (Exception ex)
+        {
+            toolStripStatusLabel.Text = "导出失败";
+            MessageBox.Show($"导出失败: {ex.Message}");
+            RecordSyncHistory(
+                operation: "export-md",
+                status: "failed",
+                options: null,
+                startedAt: startedAt,
+                finishedAt: DateTime.Now,
+                summary: $"导出失败: {ex.Message}",
+                result: null,
+                topLevelError: ex.Message);
+        }
+        finally
+        {
+            _exportCts?.Dispose();
+            _exportCts = null;
+            toolStripCancel.Enabled = false;
+            SetToolbarEnabled(true);
+            toolStripProgressBar.Style = ProgressBarStyle.Blocks;
+        }
+    }
+
     private async Task RunSyncAsync(List<OneNoteTreeNode> nodes, SyncOptions options)
     {
+        var startedAt = DateTime.Now;
+        var aggregateResult = new SyncResult();
         _notionApiClient.MaxRetries = (int)numericRetryCount.Value;
         var totalNodes = NotionSyncOrchestrator.CountAllNodes(nodes);
 
@@ -121,7 +272,6 @@ public partial class Form1 : Form
 
         try
         {
-            var aggregateResult = new SyncResult();
             foreach (var node in nodes)
             {
                 var result = await _syncOrchestrator.SyncAsync(node, options, progress, ct);
@@ -143,6 +293,14 @@ public partial class Form1 : Form
             }
             toolStripStatusLabel.Text = summary;
             toolStripProgressBar.Value = totalNodes;
+            RecordSyncHistory(
+                operation: "sync",
+                status: aggregateResult.FailedPages.Count > 0 ? "partial" : "success",
+                options: options,
+                startedAt: startedAt,
+                finishedAt: DateTime.Now,
+                summary: summary,
+                result: aggregateResult);
 
             if (options.DryRun && aggregateResult.LogEntries.Count > 0)
             {
@@ -161,11 +319,28 @@ public partial class Form1 : Form
         catch (OperationCanceledException)
         {
             toolStripStatusLabel.Text = "同步已取消";
+            RecordSyncHistory(
+                operation: "sync",
+                status: "canceled",
+                options: options,
+                startedAt: startedAt,
+                finishedAt: DateTime.Now,
+                summary: "同步已取消",
+                result: aggregateResult);
         }
         catch (Exception ex)
         {
             toolStripStatusLabel.Text = "同步失败";
             MessageBox.Show($"同步失败: {ex.Message}");
+            RecordSyncHistory(
+                operation: "sync",
+                status: "failed",
+                options: options,
+                startedAt: startedAt,
+                finishedAt: DateTime.Now,
+                summary: $"同步失败: {ex.Message}",
+                result: aggregateResult,
+                topLevelError: ex.Message);
         }
         finally
         {
@@ -179,6 +354,8 @@ public partial class Form1 : Form
 
     private async Task RunRetrySyncAsync(List<FailedSyncItem> failedItems, SyncOptions options)
     {
+        var startedAt = DateTime.Now;
+        var result = new SyncResult();
         _notionApiClient.MaxRetries = (int)numericRetryCount.Value;
         var totalNodes = failedItems.Sum(f => NotionSyncOrchestrator.CountNodes(f.Node));
 
@@ -201,7 +378,7 @@ public partial class Form1 : Form
 
         try
         {
-            var result = await _syncOrchestrator.RetrySyncAsync(failedItems, options, progress, ct);
+            result = await _syncOrchestrator.RetrySyncAsync(failedItems, options, progress, ct);
 
             if (!options.DryRun)
             {
@@ -218,6 +395,14 @@ public partial class Form1 : Form
             }
             toolStripStatusLabel.Text = summary;
             toolStripProgressBar.Value = totalNodes;
+            RecordSyncHistory(
+                operation: "retry",
+                status: result.FailedPages.Count > 0 ? "partial" : "success",
+                options: options,
+                startedAt: startedAt,
+                finishedAt: DateTime.Now,
+                summary: summary,
+                result: result);
 
             if (result.FailedPages.Count > 0)
             {
@@ -227,11 +412,28 @@ public partial class Form1 : Form
         catch (OperationCanceledException)
         {
             toolStripStatusLabel.Text = "重试已取消";
+            RecordSyncHistory(
+                operation: "retry",
+                status: "canceled",
+                options: options,
+                startedAt: startedAt,
+                finishedAt: DateTime.Now,
+                summary: "重试已取消",
+                result: result);
         }
         catch (Exception ex)
         {
             toolStripStatusLabel.Text = "重试失败";
             MessageBox.Show($"重试失败: {ex.Message}");
+            RecordSyncHistory(
+                operation: "retry",
+                status: "failed",
+                options: options,
+                startedAt: startedAt,
+                finishedAt: DateTime.Now,
+                summary: $"重试失败: {ex.Message}",
+                result: result,
+                topLevelError: ex.Message);
         }
         finally
         {
@@ -331,6 +533,11 @@ public partial class Form1 : Form
         }
 
         NavigateToNotionPage(target);
+    }
+
+    private void ToolStripButtonHistory_Click(object sender, EventArgs e)
+    {
+        ShowSyncHistoryDialog();
     }
 
     private void ButtonTokenHelp_Click(object sender, EventArgs e)
@@ -562,6 +769,7 @@ public partial class Form1 : Form
         toolStripBulkArchive.Enabled = enabled;
         toolStripBulkMove.Enabled = enabled;
         toolStripOpenNotion.Enabled = enabled;
+        toolStripHistory.Enabled = enabled;
     }
 
     private void HandleOneNoteInitializationFailure(Exception ex)
@@ -915,6 +1123,7 @@ public partial class Form1 : Form
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         SaveConfig();
+        SaveSyncHistory();
         base.OnFormClosing(e);
     }
 }

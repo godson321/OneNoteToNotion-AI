@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Text;
 
@@ -7,6 +7,7 @@ namespace OneNoteToNotion.Infrastructure;
 internal static class DiagnosticLogger
 {
     private static readonly object SyncRoot = new();
+    private static readonly AsyncLocal<string?> OriginalPathContext = new();
     private static readonly string LogDirectory = Path.Combine(
         AppDomain.CurrentDomain.BaseDirectory,
         "logs");
@@ -31,6 +32,17 @@ internal static class DiagnosticLogger
 
     public static void Error(string message, Exception? exception = null) => Write("ERROR", message, exception);
 
+    public static IDisposable BeginOriginalPathScope(string? originalPath)
+    {
+        var previous = OriginalPathContext.Value;
+        if (!string.IsNullOrWhiteSpace(originalPath))
+        {
+            OriginalPathContext.Value = originalPath;
+        }
+
+        return new OriginalPathScope(previous);
+    }
+
     public static string DescribeException(Exception exception)
     {
         var builder = new StringBuilder();
@@ -53,7 +65,13 @@ internal static class DiagnosticLogger
 
     private static void Write(string level, string message, Exception? exception)
     {
-        var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{level}] [T{Environment.CurrentManagedThreadId}] {message}";
+        var originalPath = OriginalPathContext.Value;
+        if (string.IsNullOrWhiteSpace(originalPath))
+        {
+            originalPath = "-";
+        }
+
+        var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{level}] [T{Environment.CurrentManagedThreadId}] {message} | 原始路径={originalPath}";
         if (exception is not null)
         {
             line += $" | {DescribeException(exception)}";
@@ -119,4 +137,27 @@ internal static class DiagnosticLogger
             }
         }
     }
+
+    private sealed class OriginalPathScope : IDisposable
+    {
+        private readonly string? _previous;
+        private bool _disposed;
+
+        public OriginalPathScope(string? previous)
+        {
+            _previous = previous;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            OriginalPathContext.Value = _previous;
+            _disposed = true;
+        }
+    }
 }
+

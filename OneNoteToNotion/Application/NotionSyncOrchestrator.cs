@@ -41,7 +41,15 @@ public sealed class NotionSyncOrchestrator
         var result = new SyncResult();
         var totalNodes = CountNodes(rootNode);
         var counter = new SyncCounter { Total = totalNodes };
-        await SyncNodeAsync(rootNode, options.ParentPageId, options, result, progress, counter, cancellationToken);
+        await SyncNodeAsync(
+            rootNode,
+            options.ParentPageId,
+            options,
+            result,
+            progress,
+            counter,
+            CombineOriginalPath(null, rootNode.Name),
+            cancellationToken);
         return result;
     }
 
@@ -75,7 +83,15 @@ public sealed class NotionSyncOrchestrator
 
         foreach (var item in failedItems)
         {
-            await SyncNodeAsync(item.Node, item.ParentPageId, options, result, progress, counter, cancellationToken);
+            await SyncNodeAsync(
+                item.Node,
+                item.ParentPageId,
+                options,
+                result,
+                progress,
+                counter,
+                CombineOriginalPath(null, item.Node.Name),
+                cancellationToken);
         }
 
         return result;
@@ -108,10 +124,12 @@ public sealed class NotionSyncOrchestrator
         SyncResult result,
         IProgress<SyncProgress>? progress,
         SyncCounter counter,
+        string originalPath,
         CancellationToken cancellationToken,
         List<Task>? pendingApiTasks = null,
         int depth = 0)
     {
+        using var _ = DiagnosticLogger.BeginOriginalPathScope(originalPath);
         cancellationToken.ThrowIfCancellationRequested();
 
         // The root call owns the pending tasks list and awaits them at the end
@@ -221,8 +239,17 @@ public sealed class NotionSyncOrchestrator
             // Children are processed sequentially to keep COM calls on the STA thread
             foreach (var child in sourceNode.Children)
             {
-                await SyncNodeAsync(child, createdPageId, options, result, progress, counter,
-                    cancellationToken, pendingApiTasks, depth + 1);
+                await SyncNodeAsync(
+                    child,
+                    createdPageId,
+                    options,
+                    result,
+                    progress,
+                    counter,
+                    CombineOriginalPath(originalPath, child.Name),
+                    cancellationToken,
+                    pendingApiTasks,
+                    depth + 1);
             }
         }
         catch (OperationCanceledException)
@@ -461,6 +488,16 @@ public sealed class NotionSyncOrchestrator
             "webp" => "webp",
             _ => "jpg"
         };
+    }
+
+    private static string CombineOriginalPath(string? parentPath, string nodeName)
+    {
+        if (string.IsNullOrWhiteSpace(parentPath))
+        {
+            return nodeName;
+        }
+
+        return $"{parentPath}/{nodeName}";
     }
 
     private static void DumpDiagnostics(string pageTitle, string rawXml, SemanticDocument semanticDoc)

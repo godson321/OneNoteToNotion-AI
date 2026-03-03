@@ -17,11 +17,37 @@ public sealed record ParagraphBlock(
     LayoutHint Layout = LayoutHint.Normal,
     int IndentLevel = 0) : SemanticBlock;
 
-public sealed record BulletedListBlock(IReadOnlyList<IReadOnlyList<TextRun>> Items) : SemanticBlock;
+public sealed record BulletedListBlock(IReadOnlyList<IReadOnlyList<TextRun>> Items, int IndentLevel = 0) : SemanticBlock;
 
-public sealed record NumberedListBlock(IReadOnlyList<IReadOnlyList<TextRun>> Items) : SemanticBlock;
+public sealed record NumberedListBlock(IReadOnlyList<IReadOnlyList<TextRun>> Items, int IndentLevel = 0) : SemanticBlock;
 
-public sealed record TableBlock(IReadOnlyList<IReadOnlyList<IReadOnlyList<TextRun>>> Rows) : SemanticBlock;
+public sealed record TableBlock(IReadOnlyList<IReadOnlyList<TableCellBlock>> CellRows) : SemanticBlock
+{
+    // Backward-compatible view for existing consumers (e.g. Notion mapping).
+    public IReadOnlyList<IReadOnlyList<IReadOnlyList<TextRun>>> Rows { get; } =
+        CellRows
+            .Select(row => (IReadOnlyList<IReadOnlyList<TextRun>>)row
+                .Select(cell => (IReadOnlyList<TextRun>)cell.Runs)
+                .ToList())
+            .ToList();
+
+    public TableBlock(IReadOnlyList<IReadOnlyList<IReadOnlyList<TextRun>>> rows)
+        : this(rows
+            .Select(row => (IReadOnlyList<TableCellBlock>)row
+                .Select(cellRuns => new TableCellBlock(cellRuns))
+                .ToList())
+            .ToList())
+    {
+    }
+}
+
+public sealed record TableCellBlock(
+    IReadOnlyList<TextRun> Runs,
+    int RowSpan = 1,
+    int ColSpan = 1,
+    string? BackgroundColor = null,
+    string? HorizontalAlign = null,
+    string? VerticalAlign = null);
 
 public sealed record ImageBlock(
     string DataUri,
@@ -63,7 +89,11 @@ public sealed record TextStyleStyle(
     bool Strikethrough = false,
     bool Code = false,
     string? ForegroundColor = null,
-    string? BackgroundColor = null);
+    string? BackgroundColor = null,
+    string? FontSize = null,
+    string? FontFamily = null,
+    string? LineHeight = null,
+    string? LetterSpacing = null);
 
 public enum ParagraphAlignment
 {

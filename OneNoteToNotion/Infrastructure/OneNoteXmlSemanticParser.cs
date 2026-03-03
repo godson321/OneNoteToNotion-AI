@@ -8,6 +8,15 @@ namespace OneNoteToNotion.Infrastructure;
 public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
 {
     private static readonly XNamespace OneNs = "http://schemas.microsoft.com/office/onenote/2013/onenote";
+    private static readonly Regex CodeLikeHtmlFragmentRegex = new(
+        @"</?\s*(table|thead|tbody|tfoot|tr|td|th|colgroup|col|caption)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex WrapperTagRegex = new(
+        @"</?(?:html|body|div|span|p|font)\b[^>]*>",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex BreakTagRegex = new(
+        @"<br\s*/?>",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     public SemanticDocument Parse(string oneNotePageXml)
     {
@@ -56,7 +65,7 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
             if (headingMatch.Success)
             {
                 var level = int.Parse(headingMatch.Groups[1].Value);
-                var clampedLevel = Math.Clamp(level, 1, 3);
+                var clampedLevel = Math.Clamp(level, 1, 6);
 
                 // Extract style from QuickStyleDef attributes
                 var fontColor = qsd.Attribute("fontColor")?.Value;
@@ -100,13 +109,13 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
             // Flush pending list items when list type changes
             if (!isBullet && pendingBulletItems.Count > 0)
             {
-                blocks.Add(new BulletedListBlock(pendingBulletItems.ToList()));
+                blocks.Add(new BulletedListBlock(pendingBulletItems.ToList(), depth));
                 pendingBulletItems.Clear();
             }
 
             if (!isNumber && pendingNumberItems.Count > 0)
             {
-                blocks.Add(new NumberedListBlock(pendingNumberItems.ToList()));
+                blocks.Add(new NumberedListBlock(pendingNumberItems.ToList(), depth));
                 pendingNumberItems.Clear();
             }
 
@@ -157,13 +166,8 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
                     blocks.Add(tableBlock);
                 }
 
-                // OneNote 表格单元格可能包含图片（Notion 表格不支持单元格图片），
-                // 这里提取为普通图片块，避免“丢图”。
-                var tableImageBlocks = ParseImagesFromTable(tableElement);
-                if (tableImageBlocks.Count > 0)
-                {
-                    blocks.AddRange(tableImageBlocks);
-                }
+                // 注意：表格内的图片现在通过 ParseTableCell 处理并嵌入到单元格中
+                // 不再提取为单独的块，以保持 Markdown 表格结构完整
 
                 continue;
             }
@@ -204,15 +208,7 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
                         // Apply QuickStyleDef style to runs (merge with existing inline styles)
                         var styledRuns = hpb.Runs.Select(r => r with
                         {
-                            Style = new TextStyleStyle(
-                                Bold: r.Style.Bold || headingInfo.style.Bold,
-                                Italic: r.Style.Italic || headingInfo.style.Italic,
-                                Underline: r.Style.Underline || headingInfo.style.Underline,
-                                Strikethrough: r.Style.Strikethrough || headingInfo.style.Strikethrough,
-                                Code: r.Style.Code,
-                                ForegroundColor: r.Style.ForegroundColor ?? headingInfo.style.ForegroundColor,
-                                BackgroundColor: r.Style.BackgroundColor ?? headingInfo.style.BackgroundColor
-                            )
+                            Style = MergeStyles(r.Style, headingInfo.style)
                         }).ToList();
 
                         blocks.Add(new HeadingBlock(headingInfo.level, headingText, styledRuns));
@@ -237,12 +233,12 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
         // Flush any remaining list items
         if (pendingBulletItems.Count > 0)
         {
-            blocks.Add(new BulletedListBlock(pendingBulletItems.ToList()));
+            blocks.Add(new BulletedListBlock(pendingBulletItems.ToList(), depth));
         }
 
         if (pendingNumberItems.Count > 0)
         {
-            blocks.Add(new NumberedListBlock(pendingNumberItems.ToList()));
+            blocks.Add(new NumberedListBlock(pendingNumberItems.ToList(), depth));
         }
     }
 
@@ -266,15 +262,7 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
                 // Merge OE style with inline styles from CDATA
                 var styledRuns = paragraph.Runs.Select(r => r with
                 {
-                    Style = new TextStyleStyle(
-                        Bold: r.Style.Bold || oeBaseStyle.Bold,
-                        Italic: r.Style.Italic || oeBaseStyle.Italic,
-                        Underline: r.Style.Underline || oeBaseStyle.Underline,
-                        Strikethrough: r.Style.Strikethrough || oeBaseStyle.Strikethrough,
-                        Code: r.Style.Code,
-                        ForegroundColor: r.Style.ForegroundColor ?? oeBaseStyle.ForegroundColor,
-                        BackgroundColor: r.Style.BackgroundColor ?? oeBaseStyle.BackgroundColor
-                    )
+                    Style = MergeStyles(r.Style, oeBaseStyle)
                 });
                 allRuns.AddRange(styledRuns);
 
@@ -305,9 +293,9 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
         var rows = tableElement
             .Elements(OneNs + "Row")
             .Select(row =>
-                (IReadOnlyList<IReadOnlyList<TextRun>>)row
+                (IReadOnlyList<TableCellBlock>)row
                     .Elements(OneNs + "Cell")
-                    .Select(ParseCellRuns)
+                    .Select(ParseTableCell)
                     .ToList())
             .Where(row => row.Count > 0)
             .ToList();
@@ -338,12 +326,23 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
         return imageBlocks;
     }
 
-    private IReadOnlyList<TextRun> ParseCellRuns(XElement cell)
+    private TableCellBlock ParseTableCell(XElement cell)
     {
-        var cellShadingColor = cell.Attribute("shadingColor")?.Value;
+        var cellStyleAttr = GetAttributeValueIgnoreCase(cell, "style") ?? string.Empty;
+        var cellShadingColor = GetAttributeValueIgnoreCase(cell, "shadingColor", "backgroundColor")
+                               ?? ExtractCssColor(cellStyleAttr, "background-color")
+                               ?? ExtractCssBackgroundShorthand(cellStyleAttr);
+        var rowSpan = ParseSpanOrDefault(GetAttributeValueIgnoreCase(cell, "rowSpan", "rowspan"));
+        var colSpan = ParseSpanOrDefault(GetAttributeValueIgnoreCase(cell, "colSpan", "colspan", "gridSpan", "gridspan"));
+        var horizontalAlign = NormalizeHorizontalAlign(
+            ExtractCssProperty(cellStyleAttr, "text-align")
+            ?? GetAttributeValueIgnoreCase(cell, "hAlign", "horizontalAlign", "align"));
+        var verticalAlign = NormalizeVerticalAlign(
+            ExtractCssProperty(cellStyleAttr, "vertical-align")
+            ?? GetAttributeValueIgnoreCase(cell, "vAlign", "verticalAlign", "valign"));
 
         var runs = new List<TextRun>();
-        
+
         // Process OE elements in the cell (they contain style attributes)
         var oeChildren = cell.Element(OneNs + "OEChildren");
         if (oeChildren is not null)
@@ -354,25 +353,40 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
                 var oeStyleAttr = oe.Attribute("style")?.Value ?? string.Empty;
                 var oeBaseStyle = ParseElementStyle(oeStyleAttr);
 
-                foreach (var t in oe.Elements(OneNs + "T"))
+                // 处理 OE 的子元素，包括文本和图片
+                foreach (var child in oe.Elements())
                 {
-                    var paragraph = ParseParagraph(t);
-                    if (paragraph is not null)
+                    if (child.Name.LocalName == "T")
                     {
-                        // Merge OE style with inline styles from CDATA
-                        var styledRuns = paragraph.Runs.Select(r => r with
+                        // 处理文本
+                        var paragraph = ParseParagraph(child);
+                        if (paragraph is not null)
                         {
-                            Style = new TextStyleStyle(
-                                Bold: r.Style.Bold || oeBaseStyle.Bold,
-                                Italic: r.Style.Italic || oeBaseStyle.Italic,
-                                Underline: r.Style.Underline || oeBaseStyle.Underline,
-                                Strikethrough: r.Style.Strikethrough || oeBaseStyle.Strikethrough,
-                                Code: r.Style.Code,
-                                ForegroundColor: r.Style.ForegroundColor ?? oeBaseStyle.ForegroundColor,
-                                BackgroundColor: r.Style.BackgroundColor ?? oeBaseStyle.BackgroundColor
-                            )
-                        });
-                        runs.AddRange(styledRuns);
+                            // Merge OE style with inline styles from CDATA
+                            var styledRuns = paragraph.Runs.Select(r => r with
+                            {
+                                Style = MergeStyles(r.Style, oeBaseStyle)
+                            });
+                            runs.AddRange(styledRuns);
+                        }
+                    }
+                    else if (child.Name.LocalName == "Image")
+                    {
+                        // 处理单元格内的图片 - 转换为 Markdown 图片语法
+                        var imageBlock = ParseImage(child, out _);
+                        if (imageBlock is not null && !string.IsNullOrWhiteSpace(imageBlock.DataUri))
+                        {
+                            var altText = !string.IsNullOrWhiteSpace(imageBlock.Caption) ? imageBlock.Caption : "图片";
+                            var safeAltText = altText.Replace("\r", " ")
+                                                     .Replace("\n", " ")
+                                                     .Replace("[", "\\[")
+                                                     .Replace("]", "\\]")
+                                                     .Replace("|", "\\|");
+                            var cleanDataUri = imageBlock.DataUri.Replace("\r", "").Replace("\n", "");
+                            var mdImage = $"![{safeAltText}]({cleanDataUri})";
+                            // 将 Markdown 图片语法作为普通文本添加
+                            runs.Add(new TextRun(mdImage, oeBaseStyle));
+                        }
                     }
                 }
             }
@@ -396,7 +410,73 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
             runs.Add(new TextRun(string.Empty, style));
         }
 
-        return runs;
+        return new TableCellBlock(
+            runs,
+            RowSpan: rowSpan,
+            ColSpan: colSpan,
+            BackgroundColor: cellShadingColor,
+            HorizontalAlign: horizontalAlign,
+            VerticalAlign: verticalAlign);
+    }
+
+    private static string? GetAttributeValueIgnoreCase(XElement element, params string[] attributeNames)
+    {
+        foreach (var attributeName in attributeNames)
+        {
+            var value = element
+                .Attributes()
+                .FirstOrDefault(a => a.Name.LocalName.Equals(attributeName, StringComparison.OrdinalIgnoreCase))
+                ?.Value;
+
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private static int ParseSpanOrDefault(string? rawValue)
+    {
+        return int.TryParse(rawValue, out var parsed) && parsed > 1 ? parsed : 1;
+    }
+
+    private static string? NormalizeHorizontalAlign(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "left" => "left",
+            "center" => "center",
+            "right" => "right",
+            "justify" => "justify",
+            "start" => "left",
+            "end" => "right",
+            _ => null
+        };
+    }
+
+    private static string? NormalizeVerticalAlign(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "top" => "top",
+            "middle" => "middle",
+            "center" => "middle",
+            "bottom" => "bottom",
+            "baseline" => "baseline",
+            _ => null
+        };
     }
 
     private static ParagraphBlock? ParseParagraph(XElement textElement)
@@ -415,6 +495,20 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
             }
 
             return new ParagraphBlock([new TextRun(plainText, baseStyle)]);
+        }
+
+        if (ShouldTreatCDataAsRawText(cdata))
+        {
+            var rawText = ExtractRawTextFromCData(cdata);
+            if (string.IsNullOrWhiteSpace(rawText))
+            {
+                return null;
+            }
+
+            return new ParagraphBlock(
+                [new TextRun(rawText, baseStyle)],
+                ParseAlignment(cdata),
+                ParseLayoutHint(cdata));
         }
 
         var html = new HtmlAgilityPack.HtmlDocument();
@@ -438,6 +532,27 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
         return new ParagraphBlock(runs, alignment, layoutHint);
     }
 
+    private static bool ShouldTreatCDataAsRawText(string cdata)
+    {
+        if (string.IsNullOrWhiteSpace(cdata))
+        {
+            return false;
+        }
+
+        // Pasted pseudo code often contains table/html tags that should remain literal text.
+        return CodeLikeHtmlFragmentRegex.IsMatch(cdata);
+    }
+
+    private static string ExtractRawTextFromCData(string cdata)
+    {
+        var normalized = NormalizeLineEndings(cdata);
+        normalized = BreakTagRegex.Replace(normalized, "\n");
+        normalized = WrapperTagRegex.Replace(normalized, string.Empty);
+        normalized = HtmlAgilityPack.HtmlEntity.DeEntitize(normalized);
+        normalized = normalized.Replace('\u00A0', ' ');
+        return NormalizeLineEndings(normalized);
+    }
+
     /// <summary>
     /// Parse CSS-like style attribute from a OneNote XML element (e.g. &lt;one:T style="..."&gt;)
     /// into a base TextStyleStyle.
@@ -459,8 +574,39 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
         var foreground = ExtractCssColor(inlineStyle, "color");
         var background = ExtractCssColor(inlineStyle, "background-color")
                          ?? ExtractCssBackgroundShorthand(inlineStyle);
+        var fontSize = NormalizeCssDimension(ExtractCssProperty(inlineStyle, "font-size"));
+        var fontFamily = NormalizeFontFamily(ExtractCssProperty(inlineStyle, "font-family"));
+        var lineHeight = NormalizeCssDimension(ExtractCssProperty(inlineStyle, "line-height"));
+        var letterSpacing = NormalizeCssDimension(ExtractCssProperty(inlineStyle, "letter-spacing"));
 
-        return new TextStyleStyle(bold, italic, underline, strikethrough, false, foreground, background);
+        return new TextStyleStyle(
+            bold,
+            italic,
+            underline,
+            strikethrough,
+            false,
+            foreground,
+            background,
+            fontSize,
+            fontFamily,
+            lineHeight,
+            letterSpacing);
+    }
+
+    private static TextStyleStyle MergeStyles(TextStyleStyle primary, TextStyleStyle fallback)
+    {
+        return new TextStyleStyle(
+            Bold: primary.Bold || fallback.Bold,
+            Italic: primary.Italic || fallback.Italic,
+            Underline: primary.Underline || fallback.Underline,
+            Strikethrough: primary.Strikethrough || fallback.Strikethrough,
+            Code: primary.Code || fallback.Code,
+            ForegroundColor: primary.ForegroundColor ?? fallback.ForegroundColor,
+            BackgroundColor: primary.BackgroundColor ?? fallback.BackgroundColor,
+            FontSize: primary.FontSize ?? fallback.FontSize,
+            FontFamily: primary.FontFamily ?? fallback.FontFamily,
+            LineHeight: primary.LineHeight ?? fallback.LineHeight,
+            LetterSpacing: primary.LetterSpacing ?? fallback.LetterSpacing);
     }
 
     private static void CollectRuns(HtmlAgilityPack.HtmlNode node, TextStyleStyle inheritedStyle, string? inheritedLink, ICollection<TextRun> runs)
@@ -535,6 +681,18 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
                 {
                     style = style with { ForegroundColor = fontColor };
                 }
+
+                var face = NormalizeFontFamily(node.GetAttributeValue("face", string.Empty));
+                if (!string.IsNullOrWhiteSpace(face))
+                {
+                    style = style with { FontFamily = face };
+                }
+
+                var size = NormalizeCssDimension(node.GetAttributeValue("size", string.Empty));
+                if (!string.IsNullOrWhiteSpace(size))
+                {
+                    style = style with { FontSize = size };
+                }
                 break;
             }
         }
@@ -574,6 +732,30 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
         if (!string.IsNullOrWhiteSpace(background))
         {
             style = style with { BackgroundColor = background };
+        }
+
+        var fontSize = NormalizeCssDimension(ExtractCssProperty(inlineStyle, "font-size"));
+        if (!string.IsNullOrWhiteSpace(fontSize))
+        {
+            style = style with { FontSize = fontSize };
+        }
+
+        var fontFamily = NormalizeFontFamily(ExtractCssProperty(inlineStyle, "font-family"));
+        if (!string.IsNullOrWhiteSpace(fontFamily))
+        {
+            style = style with { FontFamily = fontFamily };
+        }
+
+        var lineHeight = NormalizeCssDimension(ExtractCssProperty(inlineStyle, "line-height"));
+        if (!string.IsNullOrWhiteSpace(lineHeight))
+        {
+            style = style with { LineHeight = lineHeight };
+        }
+
+        var letterSpacing = NormalizeCssDimension(ExtractCssProperty(inlineStyle, "letter-spacing"));
+        if (!string.IsNullOrWhiteSpace(letterSpacing))
+        {
+            style = style with { LetterSpacing = letterSpacing };
         }
 
         foreach (var child in node.ChildNodes)
@@ -622,8 +804,13 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
         return LayoutHint.Normal;
     }
 
-    private static string? ExtractCssColor(string inlineStyle, string propertyName)
+    private static string? ExtractCssProperty(string inlineStyle, string propertyName)
     {
+        if (string.IsNullOrWhiteSpace(inlineStyle))
+        {
+            return null;
+        }
+
         var match = Regex.Match(inlineStyle, $"(?<![\\w-]){Regex.Escape(propertyName)}\\s*:\\s*([^;]+)", RegexOptions.IgnoreCase);
         if (!match.Success)
         {
@@ -631,6 +818,34 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
         }
 
         return match.Groups[1].Value.Trim();
+    }
+
+    private static string? ExtractCssColor(string inlineStyle, string propertyName)
+    {
+        return ExtractCssProperty(inlineStyle, propertyName);
+    }
+
+    private static string? NormalizeCssDimension(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        return value.Trim();
+    }
+
+    private static string? NormalizeFontFamily(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        // Drop quotes so the value can pass downstream sanitizer consistently.
+        return value.Replace("\"", string.Empty, StringComparison.Ordinal)
+                    .Replace("'", string.Empty, StringComparison.Ordinal)
+                    .Trim();
     }
 
     /// <summary>
@@ -832,10 +1047,35 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
 
             if (!result.Success)
             {
+                // GDI+ 处理失败，但对于 Markdown 导出，我们仍然可以使用原始 base64 数据
+                // 创建一个包含原始数据的图片块
                 error = result.ErrorMessage ?? "图片处理失败";
-                DiagnosticLogger.Warn(
-                    $"图片处理失败: format={format}, originalSize={result.OriginalSize}, reason={error}");
-                return null;
+                
+                // 使用原始 base64 数据构建 data URI
+                var mimeType = format.ToLowerInvariant() switch
+                {
+                    "jpg" or "jpeg" => "image/jpeg",
+                    "png" => "image/png",
+                    "gif" => "image/gif",
+                    "bmp" => "image/bmp",
+                    "tiff" or "tif" => "image/tiff",
+                    "webp" => "image/webp",
+                    "svg" => "image/svg+xml",
+                    _ => "image/png"
+                };
+                
+                var rawDataUri = $"data:{mimeType};base64,{base64Data}";
+                
+                return new ImageBlock(
+                    rawDataUri,
+                    caption,
+                    format,
+                    result.OriginalSize,
+                    result.OriginalSize,
+                    IsProcessed: false,
+                    ProcessingError: $"GDI+处理失败: {error}",
+                    Width: width,
+                    Height: height);
             }
 
             if (!string.IsNullOrWhiteSpace(result.ErrorMessage))
@@ -985,3 +1225,4 @@ public sealed class OneNoteXmlSemanticParser : ISemanticDocumentParser
     }
 
 }
+

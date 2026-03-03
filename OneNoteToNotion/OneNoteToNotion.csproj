@@ -14,10 +14,14 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Reference Include="Interop.Microsoft.Office.Interop.OneNote">
-      <HintPath>bin\Debug\net10.0-windows7.0\Interop.Microsoft.Office.Interop.OneNote.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
+    <COMReference Include="Microsoft.Office.Interop.OneNote">
+      <Guid>{0EA692EE-BB50-4E3C-AEF0-356D91732725}</Guid>
+      <VersionMajor>1</VersionMajor>
+      <VersionMinor>1</VersionMinor>
+      <Lcid>0</Lcid>
+      <WrapperTool>tlbimp</WrapperTool>
+      <EmbedInteropTypes>true</EmbedInteropTypes>
+    </COMReference>
   </ItemGroup>
 
 </Project>
