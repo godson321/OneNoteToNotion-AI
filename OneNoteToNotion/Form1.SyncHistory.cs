@@ -333,7 +333,12 @@ public partial class Form1
                 MessageBox.Show($"以下错误项无法重试：{Environment.NewLine}{brief}{more}");
             }
 
-            var options = new SyncOptions(token, parentPageId, checkBoxDryRun.Checked);
+            var options = new SyncOptions(
+                token,
+                parentPageId,
+                checkBoxDryRun.Checked,
+                GetSelectedTableCellColorMappingMode());
+            ConfigureNotionApiClientPrivateSettings();
             dialog.Close();
             _ = RunRetrySyncAsync(retryItems, options);
         };

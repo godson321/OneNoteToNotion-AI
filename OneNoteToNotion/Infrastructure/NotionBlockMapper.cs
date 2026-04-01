@@ -10,15 +10,16 @@ public sealed class NotionBlockMapper : INotionBlockMapper
 {
     private readonly NotionStyleMappingRules _rules = new();
 
-    public IReadOnlyList<NotionBlockInput> Map(SemanticDocument semanticDocument)
+    public IReadOnlyList<NotionBlockInput> Map(
+        SemanticDocument semanticDocument,
+        TableCellColorMappingMode tableCellColorMappingMode = TableCellColorMappingMode.Background)
     {
         var blocks = new List<NotionBlockInput>();
         var indentStack = new List<NotionBlockInput?>();
 
         static bool SupportsChildren(string type)
         {
-            return type is "paragraph"
-                   or "bulleted_list_item"
+            return type is "bulleted_list_item"
                    or "numbered_list_item"
                    or "to_do"
                    or "toggle"
@@ -26,6 +27,22 @@ public sealed class NotionBlockMapper : INotionBlockMapper
                    or "callout"
                    or "synced_block"
                    or "template";
+        }
+
+        static bool CanAttachChild(string parentType, string childType)
+        {
+            if (!SupportsChildren(parentType))
+            {
+                return false;
+            }
+
+            // Avoid nesting paragraphs under list items; keep only nested lists to prevent Notion validation errors.
+            if (parentType is "bulleted_list_item" or "numbered_list_item")
+            {
+                return childType is "bulleted_list_item" or "numbered_list_item";
+            }
+
+            return true;
         }
 
         void AddBlockWithIndent(NotionBlockInput block, int indentLevel)
@@ -42,7 +59,7 @@ public sealed class NotionBlockMapper : INotionBlockMapper
             while (parentDepth >= 0)
             {
                 var candidate = indentStack[parentDepth];
-                if (candidate is not null && SupportsChildren(candidate.Type))
+                if (candidate is not null && CanAttachChild(candidate.Type, block.Type))
                 {
                     candidate.Children.Add(block);
                     break;
@@ -101,7 +118,7 @@ public sealed class NotionBlockMapper : INotionBlockMapper
                     }, paragraphIndent);
                     break;
                 case TableBlock table:
-                    foreach (var tableBlock in BuildTableBlocks(table))
+                    foreach (var tableBlock in BuildTableBlocks(table, tableCellColorMappingMode))
                     {
                         AddBlockWithIndent(tableBlock, 0);
                     }
@@ -227,56 +244,68 @@ public sealed class NotionBlockMapper : INotionBlockMapper
 
     private const int NotionMaxTableRows = 100;
 
-    private IEnumerable<NotionBlockInput> BuildTableBlocks(TableBlock table)
+    private IEnumerable<NotionBlockInput> BuildTableBlocks(
+        TableBlock table,
+        TableCellColorMappingMode tableCellColorMappingMode)
     {
-        if (table.Rows.Count <= NotionMaxTableRows)
+        if (table.CellRows.Count <= NotionMaxTableRows)
         {
-            yield return BuildSingleTableBlock(table.Rows, 0, table.Rows.Count, hasHeader: table.Rows.Count > 1);
+            yield return BuildSingleTableBlock(
+                table.CellRows,
+                0,
+                table.CellRows.Count,
+                hasHeader: table.CellRows.Count > 1,
+                tableCellColorMappingMode);
             yield break;
         }
 
         // Split large table: first chunk = header + 99 data rows, subsequent chunks = header + 99 data rows
-        var headerRow = table.Rows[0];
-        var dataRows = table.Rows.Skip(1).ToList();
+        var headerRow = table.CellRows[0];
+        var dataRows = table.CellRows.Skip(1).ToList();
         var chunkSize = NotionMaxTableRows - 1; // Reserve 1 row for header
 
         for (var i = 0; i < dataRows.Count; i += chunkSize)
         {
-            var chunkRows = new List<IReadOnlyList<IReadOnlyList<TextRun>>> { headerRow };
+            var chunkRows = new List<IReadOnlyList<TableCellBlock>> { headerRow };
             chunkRows.AddRange(dataRows.Skip(i).Take(chunkSize));
 
-            yield return BuildSingleTableBlock(chunkRows, 0, chunkRows.Count, hasHeader: true);
+            yield return BuildSingleTableBlock(
+                chunkRows,
+                0,
+                chunkRows.Count,
+                hasHeader: true,
+                tableCellColorMappingMode);
         }
     }
 
     private NotionBlockInput BuildSingleTableBlock(
-        IReadOnlyList<IReadOnlyList<IReadOnlyList<TextRun>>> rows,
-        int startIndex, int count, bool hasHeader)
+        IReadOnlyList<IReadOnlyList<TableCellBlock>> rows,
+        int startIndex,
+        int count,
+        bool hasHeader,
+        TableCellColorMappingMode tableCellColorMappingMode)
     {
-        var tableWidth = rows.Max(r => r.Count);
-        var children = rows
+        var slicedRows = rows
             .Skip(startIndex)
             .Take(count)
+            .ToList();
+        var tableWidth = slicedRows.Count == 0 ? 0 : slicedRows.Max(r => r.Count);
+        var rowBackgroundColors = slicedRows
+            .Select(row => ResolveUniformRowBackgroundColor(row, tableCellColorMappingMode))
+            .ToList();
+        var children = slicedRows
             .Select((row, rowIndex) => new NotionBlockInput
             {
                 Type = "table_row",
                 Value = new
                 {
                     cells = row
-                        .Select(cellRuns =>
+                        .Select(cell =>
                         {
-                            var runs = cellRuns as IReadOnlyList<TextRun> ?? [new TextRun(string.Empty, new TextStyleStyle())];
-
-                            // Force bold for header row (first row)
-                            if (rowIndex == 0 && hasHeader)
-                            {
-                                runs = runs.Select(r => r with
-                                {
-                                    Style = r.Style with { Bold = true }
-                                }).ToList();
-                            }
-
-                            return BuildRichText(runs);
+                            return BuildTableCellRichText(
+                                cell,
+                                forceBold: rowIndex == 0 && hasHeader,
+                                tableCellColorMappingMode);
                         })
                         .ToList()
                 }
@@ -292,8 +321,133 @@ public sealed class NotionBlockMapper : INotionBlockMapper
                 has_column_header = hasHeader,
                 has_row_header = false
             },
-            Children = children
+            Children = children,
+            TableRowBackgroundColors = rowBackgroundColors
         };
+    }
+
+    private object[] BuildTableCellRichText(
+        TableCellBlock cell,
+        bool forceBold,
+        TableCellColorMappingMode tableCellColorMappingMode)
+    {
+        var runs = cell.Runs.Count == 0
+            ? [new TextRun(string.Empty, new TextStyleStyle())]
+            : cell.Runs;
+        var mappedCellBackgroundColor = _rules.MapBackgroundColor(ResolveCellBackgroundColor(cell));
+        var shouldUseCellBackground = tableCellColorMappingMode == TableCellColorMappingMode.Background
+                                      && mappedCellBackgroundColor != "default";
+
+        if (shouldUseCellBackground && runs.All(static run => string.IsNullOrEmpty(run.Text)))
+        {
+            // Use zero-width placeholder to ensure Notion renders background color on empty cells.
+            runs = [new TextRun("\u200B", new TextStyleStyle())];
+        }
+
+        return SplitLongRuns(runs)
+            .Select(run =>
+            {
+                var style = forceBold ? run.Style with { Bold = true } : run.Style;
+                return (object)new
+                {
+                    type = "text",
+                    text = new
+                    {
+                        content = PreserveIndentationForNotion(run.Text),
+                        link = run.Link is null ? null : new { url = run.Link }
+                    },
+                    annotations = new
+                    {
+                        bold = style.Bold,
+                        italic = style.Italic,
+                        underline = style.Underline,
+                        strikethrough = style.Strikethrough,
+                        code = style.Code,
+                        color = ResolveTableCellColor(
+                            style,
+                            tableCellColorMappingMode,
+                            mappedCellBackgroundColor)
+                    }
+                };
+            })
+            .ToArray();
+    }
+
+    private string ResolveTableCellColor(
+        TextStyleStyle style,
+        TableCellColorMappingMode tableCellColorMappingMode,
+        string mappedCellBackgroundColor)
+    {
+        if (tableCellColorMappingMode == TableCellColorMappingMode.Background
+            && mappedCellBackgroundColor != "default")
+        {
+            // Cell background is applied via private API; keep rich_text color as foreground/default
+            // to avoid double background rendering.
+            return ResolveForegroundOnlyColor(style);
+        }
+
+        return ResolveColor(style);
+    }
+
+    private string ResolveForegroundOnlyColor(TextStyleStyle style)
+    {
+        if (!string.IsNullOrWhiteSpace(style.ForegroundColor))
+        {
+            return _rules.MapColor(style.ForegroundColor);
+        }
+
+        return "default";
+    }
+
+    private string? ResolveUniformRowBackgroundColor(
+        IReadOnlyList<TableCellBlock> row,
+        TableCellColorMappingMode tableCellColorMappingMode)
+    {
+        if (tableCellColorMappingMode != TableCellColorMappingMode.Background || row.Count == 0)
+        {
+            return null;
+        }
+
+        string? uniformColor = null;
+        foreach (var cell in row)
+        {
+            var color = _rules.MapBackgroundColor(ResolveCellBackgroundColor(cell));
+            if (color == "default")
+            {
+                return null;
+            }
+
+            if (uniformColor is null)
+            {
+                uniformColor = color;
+                continue;
+            }
+
+            if (!string.Equals(uniformColor, color, StringComparison.Ordinal))
+            {
+                return null;
+            }
+        }
+
+        return uniformColor;
+    }
+
+    private static string? ResolveCellBackgroundColor(TableCellBlock cell)
+    {
+        if (!string.IsNullOrWhiteSpace(cell.BackgroundColor))
+        {
+            return cell.BackgroundColor;
+        }
+
+        foreach (var run in cell.Runs)
+        {
+            if (!string.IsNullOrWhiteSpace(run.Style.BackgroundColor))
+            {
+                return run.Style.BackgroundColor;
+            }
+        }
+
+        return null;
     }
 
     private const int NotionMaxTextLength = 2000;

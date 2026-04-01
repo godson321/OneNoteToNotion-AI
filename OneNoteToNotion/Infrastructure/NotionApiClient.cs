@@ -1,6 +1,8 @@
 ﻿using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using OneNoteToNotion.Domain;
 using OneNoteToNotion.Notion;
 
 namespace OneNoteToNotion.Infrastructure;
@@ -15,12 +17,16 @@ public sealed class NotionApiClient : INotionApiClient
     private readonly SemaphoreSlim _concurrencyLimiter = new(3, 3);
     private readonly SemaphoreSlim _rateLock = new(1, 1);
     private DateTime _lastRequestTime = DateTime.MinValue;
+    private int _privateApiConfigWarningEmitted;
 
     /// <summary>
     /// Maximum number of retries for rate-limit (429) and transient network errors.
     /// Can be changed at runtime from the UI.
     /// </summary>
     public int MaxRetries { get; set; } = 3;
+    public string? PrivateApiTokenV2 { get; set; }
+    public string? PrivateApiSpaceId { get; set; }
+    public string? PrivateApiUserId { get; set; }
 
     public NotionApiClient(HttpClient httpClient)
     {
@@ -78,9 +84,56 @@ public sealed class NotionApiClient : INotionApiClient
         return SendAsync(HttpMethod.Patch, $"pages/{pageId}", payload, token, cancellationToken);
     }
 
-    public Task AppendBlocksAsync(string pageId, IReadOnlyList<NotionBlockInput> blocks, string token, CancellationToken cancellationToken)
+    public Task AppendBlocksAsync(
+        string pageId,
+        IReadOnlyList<NotionBlockInput> blocks,
+        string token,
+        TableCellColorMappingMode tableCellColorMappingMode,
+        CancellationToken cancellationToken)
     {
-        return AppendBlocksChunkedAsync(pageId, blocks, token, cancellationToken);
+        return AppendBlocksChunkedAsync(pageId, blocks, token, tableCellColorMappingMode, cancellationToken);
+    }
+
+    public async Task<string?> TryResolvePrivateSpaceIdFromPageAsync(
+        string pageId,
+        string tokenV2,
+        CancellationToken cancellationToken)
+    {
+        var normalizedToken = NormalizePrivateToken(tokenV2);
+        if (string.IsNullOrWhiteSpace(pageId) || string.IsNullOrWhiteSpace(normalizedToken))
+        {
+            return null;
+        }
+        await _concurrencyLimiter.WaitAsync(cancellationToken);
+        try
+        {
+            foreach (var pageIdCandidate in BuildPageIdCandidates(pageId))
+            {
+                var spaceId = await TryResolveSpaceIdByGetRecordValuesAsync(
+                    pageIdCandidate,
+                    normalizedToken,
+                    cancellationToken);
+                if (!string.IsNullOrWhiteSpace(spaceId))
+                {
+                    return spaceId;
+                }
+
+                spaceId = await TryResolveSpaceIdByLoadPageChunkAsync(
+                    pageIdCandidate,
+                    normalizedToken,
+                    cancellationToken);
+                if (!string.IsNullOrWhiteSpace(spaceId))
+                {
+                    return spaceId;
+                }
+            }
+
+            return null;
+        }
+        finally
+        {
+            _concurrencyLimiter.Release();
+        }
     }
 
     public async Task<List<(string Id, string Title)>> GetChildPagesAsync(string parentPageId, string token, CancellationToken cancellationToken)
@@ -522,19 +575,696 @@ public sealed class NotionApiClient : INotionApiClient
 
     #endregion
 
-    private async Task AppendBlocksChunkedAsync(string pageId, IReadOnlyList<NotionBlockInput> blocks, string token, CancellationToken cancellationToken)
+    private async Task AppendBlocksChunkedAsync(
+        string pageId,
+        IReadOnlyList<NotionBlockInput> blocks,
+        string token,
+        TableCellColorMappingMode tableCellColorMappingMode,
+        CancellationToken cancellationToken)
     {
         const int chunkSize = 100;
         for (var i = 0; i < blocks.Count; i += chunkSize)
         {
+            var chunkIndex = i / chunkSize;
             var chunkInputs = blocks.Skip(i).Take(chunkSize).ToList();
+            if (chunkInputs.Count == 0)
+            {
+                DiagnosticLogger.Warn($"AppendBlocks chunk 为空，已跳过: pageId={pageId}, chunkIndex={chunkIndex}");
+                continue;
+            }
+
+            var blockTypeCounts = string.Join(
+                ", ",
+                chunkInputs
+                    .GroupBy(block => block.Type)
+                    .Select(group => $"{group.Key}={group.Count()}"));
+            DiagnosticLogger.Info(
+                $"AppendBlocks chunk 准备发送: pageId={pageId}, chunkIndex={chunkIndex}, count={chunkInputs.Count}, types={blockTypeCounts}");
             var chunk = chunkInputs.Select(ToBlockObject).ToList();
             var payload = new { children = chunk };
             var notionVersion = chunkInputs.Any(IsFileUploadBlock)
                 ? FileUploadNotionVersion
                 : null;
-            await SendAsync(HttpMethod.Patch, $"blocks/{pageId}/children", payload, token, cancellationToken, notionVersion);
+            using var appendResponse = await SendAsync(
+                HttpMethod.Patch,
+                $"blocks/{pageId}/children",
+                payload,
+                token,
+                cancellationToken,
+                notionVersion);
+
+            if (tableCellColorMappingMode == TableCellColorMappingMode.Background)
+            {
+                await TryApplyTableRowBackgroundColorsAsync(chunkInputs, appendResponse, token, cancellationToken);
+            }
         }
+    }
+
+    private async Task TryApplyTableRowBackgroundColorsAsync(
+        IReadOnlyList<NotionBlockInput> chunkInputs,
+        HttpResponseMessage appendResponse,
+        string token,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!TryGetPrivateApiConfig(out var tokenV2, out var spaceId, out var userId, out var privateConfigStatus))
+            {
+                if (ContainsTableBackgroundRows(chunkInputs)
+                    && Interlocked.Exchange(ref _privateApiConfigWarningEmitted, 1) == 0)
+                {
+                    DiagnosticLogger.Warn($"未配置 Notion 私有 API 凭据（{privateConfigStatus}），整格背景色将不可用。");
+                }
+                return;
+            }
+
+            var responseJson = await appendResponse.Content.ReadAsStringAsync(cancellationToken);
+            if (string.IsNullOrWhiteSpace(responseJson))
+            {
+                return;
+            }
+
+            using var appendDoc = JsonDocument.Parse(responseJson);
+            if (!appendDoc.RootElement.TryGetProperty("results", out var results)
+                || results.ValueKind != JsonValueKind.Array)
+            {
+                return;
+            }
+
+            var operations = new List<object>();
+            var rowEditTs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var pairCount = Math.Min(results.GetArrayLength(), chunkInputs.Count);
+
+            for (var i = 0; i < pairCount; i++)
+            {
+                var inputBlock = chunkInputs[i];
+                if (!string.Equals(inputBlock.Type, "table", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var rowColors = ExtractTableRowBackgroundColors(inputBlock);
+                if (rowColors.All(static c => string.IsNullOrWhiteSpace(c)))
+                {
+                    continue;
+                }
+
+                var appendedBlock = results[i];
+                var tableId = TryGetString(appendedBlock, "id");
+                if (string.IsNullOrWhiteSpace(tableId))
+                {
+                    continue;
+                }
+
+                var rowIds = await GetChildBlockIdsAsync(
+                    tableId,
+                    "table_row",
+                    token,
+                    cancellationToken);
+                if (rowIds.Count == 0)
+                {
+                    continue;
+                }
+
+                var rowCount = Math.Min(rowColors.Count, rowIds.Count);
+                for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
+                {
+                    var color = rowColors[rowIndex];
+                    if (string.IsNullOrWhiteSpace(color))
+                    {
+                        continue;
+                    }
+
+                    operations.AddRange(BuildPrivateBlockColorOperations(
+                        rowIds[rowIndex],
+                        spaceId,
+                        color,
+                        rowEditTs,
+                        userId));
+                }
+            }
+
+            if (operations.Count == 0)
+            {
+                return;
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            using var privateCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await SendPrivateSaveTransactionsFanoutAsync(
+                operations,
+                tokenV2,
+                spaceId,
+                userId,
+                privateCts.Token);
+        }
+        catch (Exception ex)
+        {
+            // 私有 API 失败不影响主同步链路，仅失去整格背景增强。
+            DiagnosticLogger.Warn($"saveTransactionsFanout 应用表格行背景失败，已回退为无整格背景: {ex.Message}");
+        }
+    }
+
+    private async Task SendPrivateSaveTransactionsFanoutAsync(
+        IReadOnlyList<object> operations,
+        string tokenV2,
+        string spaceId,
+        string? userId,
+        CancellationToken cancellationToken)
+    {
+        if (operations.Count == 0)
+        {
+            return;
+        }
+
+        var payload = new
+        {
+            requestId = Guid.NewGuid().ToString(),
+            transactions = new[]
+            {
+                new
+                {
+                    id = Guid.NewGuid().ToString(),
+                    spaceId,
+                    debug = new { userAction = "actionRegistry.createSimpleTableColorAction" },
+                    operations
+                }
+            },
+            unretryable_error_behavior = "continue"
+        };
+
+        var jsonPayload = JsonSerializer.Serialize(payload);
+        var maxRetries = MaxRetries;
+
+        await _concurrencyLimiter.WaitAsync(cancellationToken);
+        try
+        {
+            for (var attempt = 0; attempt <= maxRetries; attempt++)
+            {
+                await ThrottleAsync(cancellationToken);
+
+                using var request = new HttpRequestMessage(HttpMethod.Post, "https://www.notion.so/api/v3/saveTransactionsFanout")
+                {
+                    Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
+                };
+                request.Headers.TryAddWithoutValidation("Cookie", $"token_v2={tokenV2}");
+                if (!string.IsNullOrWhiteSpace(userId))
+                {
+                    request.Headers.TryAddWithoutValidation("x-notion-active-user-header", userId);
+                }
+                request.Headers.TryAddWithoutValidation("x-notion-space-id", spaceId);
+
+                HttpResponseMessage response;
+                try
+                {
+                    response = await _httpClient.SendAsync(request, cancellationToken);
+                }
+                catch (HttpRequestException ex) when (attempt < maxRetries)
+                {
+                    var delay = TimeSpan.FromSeconds(2 * Math.Pow(2, attempt));
+                    DiagnosticLogger.Warn($"saveTransactionsFanout 网络错误, {delay.TotalSeconds:F1}s 后重试: {ex.Message}");
+                    await Task.Delay(delay, cancellationToken);
+                    continue;
+                }
+
+                using (response)
+                {
+                    if ((int)response.StatusCode == 429 && attempt < maxRetries)
+                    {
+                        var retryAfter = response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(Math.Pow(2, attempt));
+                        await Task.Delay(retryAfter, cancellationToken);
+                        continue;
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                        throw new InvalidOperationException($"saveTransactionsFanout failed ({(int)response.StatusCode}): {body}");
+                    }
+                }
+
+                return;
+            }
+
+            throw new InvalidOperationException($"saveTransactionsFanout 重试 {maxRetries} 次后仍失败");
+        }
+        finally
+        {
+            _concurrencyLimiter.Release();
+        }
+    }
+
+    private static IEnumerable<object> BuildPrivateBlockColorOperations(
+        string blockId,
+        string spaceId,
+        string color,
+        long editedTs,
+        string? userId)
+    {
+        var args = new Dictionary<string, object>
+        {
+            ["block_color"] = color
+        };
+
+        yield return new
+        {
+            pointer = new
+            {
+                table = "block",
+                id = blockId,
+                spaceId
+            },
+            path = new[] { "format" },
+            command = "update",
+            args
+        };
+
+        if (string.IsNullOrWhiteSpace(userId))
+        {
+            yield break;
+        }
+
+        yield return new
+        {
+            pointer = new
+            {
+                table = "block",
+                id = blockId,
+                spaceId
+            },
+            path = Array.Empty<string>(),
+            command = "update",
+            args = new
+            {
+                last_edited_time = editedTs,
+                last_edited_by_id = userId,
+                last_edited_by_table = "notion_user"
+            }
+        };
+    }
+
+    private static List<string?> ExtractTableRowBackgroundColors(NotionBlockInput tableBlock)
+    {
+        if (tableBlock.TableRowBackgroundColors is { Count: > 0 })
+        {
+            return tableBlock.TableRowBackgroundColors.ToList();
+        }
+
+        var rowColors = new List<string?>(tableBlock.Children.Count);
+        foreach (var rowBlock in tableBlock.Children)
+        {
+            rowColors.Add(ExtractUniformRowBackgroundColor(rowBlock.Value));
+        }
+
+        return rowColors;
+    }
+
+    private static string? ExtractUniformRowBackgroundColor(object rowValue)
+    {
+        using var rowDoc = JsonDocument.Parse(JsonSerializer.Serialize(rowValue));
+        if (!rowDoc.RootElement.TryGetProperty("cells", out var cells)
+            || cells.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        string? uniformColor = null;
+        foreach (var cell in cells.EnumerateArray())
+        {
+            var cellColor = ExtractCellBackgroundColor(cell);
+            if (string.IsNullOrWhiteSpace(cellColor))
+            {
+                return null;
+            }
+
+            if (uniformColor is null)
+            {
+                uniformColor = cellColor;
+                continue;
+            }
+
+            if (!string.Equals(uniformColor, cellColor, StringComparison.Ordinal))
+            {
+                return null;
+            }
+        }
+
+        return uniformColor;
+    }
+
+    private static string? ExtractCellBackgroundColor(JsonElement cellElement)
+    {
+        if (cellElement.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        foreach (var richText in cellElement.EnumerateArray())
+        {
+            if (!richText.TryGetProperty("annotations", out var annotations)
+                || !annotations.TryGetProperty("color", out var colorElement))
+            {
+                continue;
+            }
+
+            var color = colorElement.GetString();
+            if (!string.IsNullOrWhiteSpace(color)
+                && color.EndsWith("_background", StringComparison.Ordinal))
+            {
+                return color;
+            }
+        }
+
+        return null;
+    }
+
+    private async Task<List<string>> GetChildBlockIdsAsync(
+        string parentBlockId,
+        string type,
+        string token,
+        CancellationToken cancellationToken)
+    {
+        var ids = new List<string>();
+        string? cursor = null;
+
+        do
+        {
+            var url = $"blocks/{parentBlockId}/children?page_size=100";
+            if (!string.IsNullOrWhiteSpace(cursor))
+            {
+                url += $"&start_cursor={cursor}";
+            }
+
+            var response = await SendGetAsync(url, token, cancellationToken);
+            var json = await response.Content.ReadAsStringAsync(cancellationToken);
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("results", out var results) && results.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var block in results.EnumerateArray())
+                {
+                    var blockType = TryGetString(block, "type");
+                    if (!string.Equals(blockType, type, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    var blockId = TryGetString(block, "id");
+                    if (!string.IsNullOrWhiteSpace(blockId))
+                    {
+                        ids.Add(blockId);
+                    }
+                }
+            }
+
+            cursor = root.GetProperty("has_more").GetBoolean()
+                ? root.GetProperty("next_cursor").GetString()
+                : null;
+        } while (!string.IsNullOrWhiteSpace(cursor));
+
+        return ids;
+    }
+
+    private static string? TryExtractSpaceIdFromLoadPageChunk(JsonElement root, string normalizedPageId)
+    {
+        if (!root.TryGetProperty("recordMap", out var recordMap)
+            || recordMap.ValueKind != JsonValueKind.Object
+            || !recordMap.TryGetProperty("block", out var blocks)
+            || blocks.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        foreach (var blockEntry in blocks.EnumerateObject())
+        {
+            if (blockEntry.Value.ValueKind != JsonValueKind.Object
+                || !blockEntry.Value.TryGetProperty("value", out var valueElement)
+                || valueElement.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            var blockId = TryGetString(valueElement, "id");
+            var normalizedBlockId = NormalizePageId(blockId);
+            if (!string.Equals(normalizedBlockId, normalizedPageId, StringComparison.Ordinal)
+                && !string.Equals(NormalizePageId(blockEntry.Name), normalizedPageId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var spaceId = TryGetString(valueElement, "space_id");
+            if (!string.IsNullOrWhiteSpace(spaceId))
+            {
+                return spaceId;
+            }
+        }
+
+        foreach (var blockEntry in blocks.EnumerateObject())
+        {
+            if (blockEntry.Value.ValueKind != JsonValueKind.Object
+                || !blockEntry.Value.TryGetProperty("value", out var valueElement)
+                || valueElement.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            var spaceId = TryGetString(valueElement, "space_id");
+            if (!string.IsNullOrWhiteSpace(spaceId))
+            {
+                return spaceId;
+            }
+        }
+
+        return null;
+    }
+
+    private async Task<string?> TryResolveSpaceIdByGetRecordValuesAsync(
+        string pageIdCandidate,
+        string tokenV2,
+        CancellationToken cancellationToken)
+    {
+        var payload = new
+        {
+            requests = new[]
+            {
+                new
+                {
+                    id = pageIdCandidate,
+                    table = "block"
+                }
+            }
+        };
+
+        var responseText = await SendPrivateApiRequestAsync(
+            "https://www.notion.so/api/v3/getRecordValues",
+            payload,
+            tokenV2,
+            cancellationToken);
+        if (string.IsNullOrWhiteSpace(responseText))
+        {
+            return null;
+        }
+
+        using var doc = JsonDocument.Parse(responseText);
+        return TryExtractSpaceIdFromGetRecordValues(doc.RootElement, NormalizePageId(pageIdCandidate));
+    }
+
+    private async Task<string?> TryResolveSpaceIdByLoadPageChunkAsync(
+        string pageIdCandidate,
+        string tokenV2,
+        CancellationToken cancellationToken)
+    {
+        var payload = new
+        {
+            pageId = pageIdCandidate,
+            limit = 1,
+            cursor = new
+            {
+                stack = Array.Empty<object>()
+            }
+        };
+
+        var responseText = await SendPrivateApiRequestAsync(
+            "https://www.notion.so/api/v3/loadPageChunk",
+            payload,
+            tokenV2,
+            cancellationToken);
+        if (string.IsNullOrWhiteSpace(responseText))
+        {
+            return null;
+        }
+
+        using var doc = JsonDocument.Parse(responseText);
+        return TryExtractSpaceIdFromLoadPageChunk(doc.RootElement, NormalizePageId(pageIdCandidate));
+    }
+
+    private async Task<string?> SendPrivateApiRequestAsync(
+        string url,
+        object payload,
+        string tokenV2,
+        CancellationToken cancellationToken)
+    {
+        var jsonPayload = JsonSerializer.Serialize(payload);
+        await ThrottleAsync(cancellationToken);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
+        };
+        request.Headers.TryAddWithoutValidation("Cookie", $"token_v2={tokenV2}");
+
+        using var response = await _httpClient.SendAsync(request, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (response.IsSuccessStatusCode)
+        {
+            return body;
+        }
+
+        DiagnosticLogger.Warn(
+            $"私有 API 调用失败: {url}, status={(int)response.StatusCode}, body={TruncateForLog(body, 300)}");
+        return null;
+    }
+
+    private static string? TryExtractSpaceIdFromGetRecordValues(JsonElement root, string normalizedPageId)
+    {
+        if (!root.TryGetProperty("results", out var results) || results.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        foreach (var result in results.EnumerateArray())
+        {
+            if (!result.TryGetProperty("value", out var valueElement)
+                || valueElement.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            var recordId = TryGetString(valueElement, "id");
+            if (!string.Equals(NormalizePageId(recordId), normalizedPageId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var spaceId = TryGetString(valueElement, "space_id");
+            if (!string.IsNullOrWhiteSpace(spaceId))
+            {
+                return spaceId;
+            }
+        }
+
+        foreach (var result in results.EnumerateArray())
+        {
+            if (!result.TryGetProperty("value", out var valueElement)
+                || valueElement.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            var spaceId = TryGetString(valueElement, "space_id");
+            if (!string.IsNullOrWhiteSpace(spaceId))
+            {
+                return spaceId;
+            }
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyList<string> BuildPageIdCandidates(string rawPageId)
+    {
+        var normalized = NormalizePageId(rawPageId);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return Array.Empty<string>();
+        }
+
+        var candidates = new List<string>(2);
+        if (normalized.Length == 32 && normalized.All(Uri.IsHexDigit))
+        {
+            candidates.Add(
+                $"{normalized[..8]}-{normalized[8..12]}-{normalized[12..16]}-{normalized[16..20]}-{normalized[20..32]}");
+        }
+        candidates.Add(normalized);
+        return candidates;
+    }
+
+    private static string TruncateForLog(string? value, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var trimmed = value.Trim();
+        if (trimmed.Length <= maxLength)
+        {
+            return trimmed;
+        }
+
+        return trimmed[..maxLength] + "...";
+    }
+
+    private bool TryGetPrivateApiConfig(out string tokenV2, out string spaceId, out string? userId, out string status)
+    {
+        tokenV2 = NormalizePrivateToken(PrivateApiTokenV2 ?? Environment.GetEnvironmentVariable("NOTION_TOKEN_V2"));
+        spaceId = (PrivateApiSpaceId ?? Environment.GetEnvironmentVariable("NOTION_PRIVATE_SPACE_ID") ?? string.Empty).Trim();
+        userId = (PrivateApiUserId ?? Environment.GetEnvironmentVariable("NOTION_PRIVATE_USER_ID"))?.Trim();
+        var hasToken = !string.IsNullOrWhiteSpace(tokenV2);
+        var hasSpaceId = !string.IsNullOrWhiteSpace(spaceId);
+        status = hasToken && hasSpaceId
+            ? "token_v2/space_id 已配置"
+            : hasToken
+                ? "缺少 space_id"
+                : hasSpaceId
+                    ? "缺少 token_v2"
+                    : "缺少 token_v2/space_id";
+        return hasToken && hasSpaceId;
+    }
+
+    private static string NormalizePageId(string? pageId)
+    {
+        if (string.IsNullOrWhiteSpace(pageId))
+        {
+            return string.Empty;
+        }
+
+        return pageId.Replace("-", string.Empty, StringComparison.Ordinal).Trim().ToLowerInvariant();
+    }
+
+    private static string NormalizePrivateToken(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return string.Empty;
+        }
+
+        var normalized = token.Trim();
+        if (normalized.StartsWith("token_v2=", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized["token_v2=".Length..];
+        }
+
+        var semicolonIndex = normalized.IndexOf(';');
+        if (semicolonIndex > 0)
+        {
+            normalized = normalized[..semicolonIndex];
+        }
+
+        return normalized.Trim();
+    }
+
+    private static bool ContainsTableBackgroundRows(IReadOnlyList<NotionBlockInput> chunkInputs)
+    {
+        return chunkInputs
+            .Where(block => string.Equals(block.Type, "table", StringComparison.Ordinal))
+            .SelectMany(ExtractTableRowBackgroundColors)
+            .Any(color => !string.IsNullOrWhiteSpace(color));
     }
 
     private async Task ThrottleAsync(CancellationToken cancellationToken)
@@ -587,21 +1317,38 @@ public sealed class NotionApiClient : INotionApiClient
                     continue;
                 }
 
-                if ((int)response.StatusCode != 429)
+                var statusCode = (int)response.StatusCode;
+                if (statusCode == 429)
                 {
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
-                        throw new InvalidOperationException($"Notion API failed ({(int)response.StatusCode}): {responseBody}");
-                    }
-                    return response;
+                    // 429 rate limited - back off
+                    var retryAfter = response.Headers.RetryAfter?.Delta
+                                     ?? TimeSpan.FromSeconds(Math.Pow(2, attempt));
+                    DiagnosticLogger.Warn($"Notion API 429 rate limited, retry after {retryAfter.TotalSeconds:F1}s (attempt {attempt + 1}/{maxRetries})");
+                    await Task.Delay(retryAfter, cancellationToken);
+                    continue;
                 }
 
-                // 429 rate limited - back off
-                var retryAfter = response.Headers.RetryAfter?.Delta
-                                 ?? TimeSpan.FromSeconds(Math.Pow(2, attempt));
-                DiagnosticLogger.Warn($"Notion API 429 rate limited, retry after {retryAfter.TotalSeconds:F1}s (attempt {attempt + 1}/{maxRetries})");
-                await Task.Delay(retryAfter, cancellationToken);
+                if (statusCode is >= 500 and <= 599 && attempt < maxRetries)
+                {
+                    var delay = TimeSpan.FromSeconds(2 * Math.Pow(2, attempt)); // 2s, 4s, 8s, 16s...
+                    var hasChildren = jsonPayload.Contains("\"children\"", StringComparison.Ordinal);
+                    DiagnosticLogger.Warn(
+                        $"Notion API {statusCode} 服务端错误, payloadLen={jsonPayload.Length}, hasChildren={hasChildren}, {delay.TotalSeconds:F1}s 后重试 (attempt {attempt + 1}/{maxRetries})");
+                    response.Dispose();
+                    await Task.Delay(delay, cancellationToken);
+                    continue;
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    var hasChildren = jsonPayload.Contains("\"children\"", StringComparison.Ordinal);
+                    DiagnosticLogger.Warn(
+                        $"Notion API 非成功响应: status={statusCode}, payloadLen={jsonPayload.Length}, hasChildren={hasChildren}");
+                    var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+                    throw new InvalidOperationException($"Notion API failed ({statusCode}): {responseBody}");
+                }
+
+                return response;
             }
 
             throw new InvalidOperationException($"Notion API 重试 {maxRetries} 次后仍然失败: {url}");
@@ -685,7 +1432,7 @@ public sealed class NotionApiClient : INotionApiClient
 
     private static object ToBlockObject(NotionBlockInput block)
     {
-        var payload = new Dictionary<string, object>
+        var payload = new Dictionary<string, object?>
         {
             ["object"] = "block",
             ["type"] = block.Type,
@@ -697,9 +1444,15 @@ public sealed class NotionApiClient : INotionApiClient
             if (SupportsChildren(block.Type))
             {
                 var childBlocks = block.Children.Select(ToBlockObject).ToList();
-                // Notion requires nested blocks in top-level `children`,
-                // not inside the type payload (e.g. `paragraph.children` is invalid).
-                payload["children"] = childBlocks;
+                if (string.Equals(block.Type, "table", StringComparison.Ordinal))
+                {
+                    // Table block requires children inside `table.children`.
+                    payload[block.Type] = AttachChildrenToTypePayload(block.Value, childBlocks);
+                }
+                else
+                {
+                    payload["children"] = childBlocks;
+                }
             }
             else
             {
@@ -710,10 +1463,16 @@ public sealed class NotionApiClient : INotionApiClient
         return payload;
     }
 
+    private static object AttachChildrenToTypePayload(object value, IReadOnlyList<object> children)
+    {
+        var payloadNode = JsonSerializer.SerializeToNode(value) as JsonObject ?? new JsonObject();
+        payloadNode["children"] = JsonSerializer.SerializeToNode(children);
+        return payloadNode;
+    }
+
     private static bool SupportsChildren(string type)
     {
-        return type is "paragraph"
-               or "bulleted_list_item"
+        return type is "bulleted_list_item"
                or "numbered_list_item"
                or "to_do"
                or "toggle"

@@ -5,5 +5,7 @@ namespace OneNoteToNotion.Mapping;
 
 public interface INotionBlockMapper
 {
-    IReadOnlyList<NotionBlockInput> Map(SemanticDocument semanticDocument);
+    IReadOnlyList<NotionBlockInput> Map(
+        SemanticDocument semanticDocument,
+        TableCellColorMappingMode tableCellColorMappingMode = TableCellColorMappingMode.Background);
 }

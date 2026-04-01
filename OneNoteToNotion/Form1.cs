@@ -30,6 +30,10 @@ public partial class Form1 : Form
     private CancellationTokenSource? _syncCts;
     private CancellationTokenSource? _exportCts;
     private bool _webViewReady;
+    private bool _isLoadingConfig;
+    private string _privateApiTokenV2 = string.Empty;
+    private string _privateApiSpaceId = string.Empty;
+    private string _privateApiUserId = string.Empty;
 
     public Form1(IOneNoteHierarchyProvider hierarchyProvider, NotionSyncOrchestrator syncOrchestrator, NotionApiClient notionApiClient)
     {
@@ -97,7 +101,12 @@ public partial class Form1 : Form
             return;
         }
 
-        var options = new SyncOptions(token, parentPageId, checkBoxDryRun.Checked);
+        var options = new SyncOptions(
+            token,
+            parentPageId,
+            checkBoxDryRun.Checked,
+            GetSelectedTableCellColorMappingMode());
+        ConfigureNotionApiClientPrivateSettings();
         await RunSyncAsync(checkedNodes, options);
     }
 
@@ -263,6 +272,9 @@ public partial class Form1 : Form
 
         _syncCts = new CancellationTokenSource();
         var ct = _syncCts.Token;
+        await TryHydratePrivateApiSettingsFromEmbeddedNotionAsync(options.ParentPageId, ct);
+        var effectiveOptions = ResolveEffectiveSyncOptions(options);
+        ConfigureNotionApiClientPrivateSettings();
 
         var progress = new Progress<SyncProgress>(p =>
         {
@@ -274,7 +286,7 @@ public partial class Form1 : Form
         {
             foreach (var node in nodes)
             {
-                var result = await _syncOrchestrator.SyncAsync(node, options, progress, ct);
+                var result = await _syncOrchestrator.SyncAsync(node, effectiveOptions, progress, ct);
                 aggregateResult.Merge(result);
             }
 
@@ -296,7 +308,7 @@ public partial class Form1 : Form
             RecordSyncHistory(
                 operation: "sync",
                 status: aggregateResult.FailedPages.Count > 0 ? "partial" : "success",
-                options: options,
+                options: effectiveOptions,
                 startedAt: startedAt,
                 finishedAt: DateTime.Now,
                 summary: summary,
@@ -322,7 +334,7 @@ public partial class Form1 : Form
             RecordSyncHistory(
                 operation: "sync",
                 status: "canceled",
-                options: options,
+                options: effectiveOptions,
                 startedAt: startedAt,
                 finishedAt: DateTime.Now,
                 summary: "同步已取消",
@@ -335,7 +347,7 @@ public partial class Form1 : Form
             RecordSyncHistory(
                 operation: "sync",
                 status: "failed",
-                options: options,
+                options: effectiveOptions,
                 startedAt: startedAt,
                 finishedAt: DateTime.Now,
                 summary: $"同步失败: {ex.Message}",
@@ -369,6 +381,9 @@ public partial class Form1 : Form
 
         _syncCts = new CancellationTokenSource();
         var ct = _syncCts.Token;
+        await TryHydratePrivateApiSettingsFromEmbeddedNotionAsync(options.ParentPageId, ct);
+        var effectiveOptions = ResolveEffectiveSyncOptions(options);
+        ConfigureNotionApiClientPrivateSettings();
 
         var progress = new Progress<SyncProgress>(p =>
         {
@@ -378,7 +393,7 @@ public partial class Form1 : Form
 
         try
         {
-            result = await _syncOrchestrator.RetrySyncAsync(failedItems, options, progress, ct);
+            result = await _syncOrchestrator.RetrySyncAsync(failedItems, effectiveOptions, progress, ct);
 
             if (!options.DryRun)
             {
@@ -398,7 +413,7 @@ public partial class Form1 : Form
             RecordSyncHistory(
                 operation: "retry",
                 status: result.FailedPages.Count > 0 ? "partial" : "success",
-                options: options,
+                options: effectiveOptions,
                 startedAt: startedAt,
                 finishedAt: DateTime.Now,
                 summary: summary,
@@ -415,7 +430,7 @@ public partial class Form1 : Form
             RecordSyncHistory(
                 operation: "retry",
                 status: "canceled",
-                options: options,
+                options: effectiveOptions,
                 startedAt: startedAt,
                 finishedAt: DateTime.Now,
                 summary: "重试已取消",
@@ -428,7 +443,7 @@ public partial class Form1 : Form
             RecordSyncHistory(
                 operation: "retry",
                 status: "failed",
-                options: options,
+                options: effectiveOptions,
                 startedAt: startedAt,
                 finishedAt: DateTime.Now,
                 summary: $"重试失败: {ex.Message}",
@@ -882,6 +897,7 @@ public partial class Form1 : Form
     {
         try
         {
+            _isLoadingConfig = true;
             if (!File.Exists(ConfigFilePath)) return;
 
             var json = File.ReadAllText(ConfigFilePath);
@@ -896,12 +912,27 @@ public partial class Form1 : Form
                 textBoxMoveParentId.Text = moveEl.GetString() ?? string.Empty;
             if (root.TryGetProperty("retryCount", out var retryEl) && retryEl.TryGetInt32(out var retryVal))
                 numericRetryCount.Value = Math.Clamp(retryVal, (int)numericRetryCount.Minimum, (int)numericRetryCount.Maximum);
+            if (root.TryGetProperty("privateApiTokenV2", out var privateTokenElement))
+                _privateApiTokenV2 = privateTokenElement.GetString() ?? string.Empty;
+            if (root.TryGetProperty("privateApiSpaceId", out var privateSpaceElement))
+                _privateApiSpaceId = privateSpaceElement.GetString() ?? string.Empty;
+            if (root.TryGetProperty("privateApiUserId", out var privateUserElement))
+                _privateApiUserId = privateUserElement.GetString() ?? string.Empty;
+            SetSelectedTableCellColorMappingMode(ParseTableCellColorMappingMode(root));
 
             DiagnosticLogger.Info("已加载本地配置");
         }
         catch (Exception ex)
         {
             DiagnosticLogger.Warn($"加载配置失败: {ex.Message}");
+        }
+        finally
+        {
+            _isLoadingConfig = false;
+            if (comboBoxTableCellColorMapping.SelectedIndex < 0)
+            {
+                comboBoxTableCellColorMapping.SelectedIndex = 0;
+            }
         }
     }
 
@@ -917,7 +948,11 @@ public partial class Form1 : Form
                 ["notionToken"] = textBoxNotionToken.Text.Trim(),
                 ["parentPageId"] = textBoxParentPageId.Text.Trim(),
                 ["moveParentId"] = textBoxMoveParentId.Text.Trim(),
-                ["retryCount"] = (int)numericRetryCount.Value
+                ["retryCount"] = (int)numericRetryCount.Value,
+                ["tableCellColorMappingMode"] = GetSelectedTableCellColorMappingMode().ToString(),
+                ["privateApiTokenV2"] = _privateApiTokenV2,
+                ["privateApiSpaceId"] = _privateApiSpaceId,
+                ["privateApiUserId"] = _privateApiUserId
             };
 
             File.WriteAllText(ConfigFilePath, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
@@ -1125,5 +1160,154 @@ public partial class Form1 : Form
         SaveConfig();
         SaveSyncHistory();
         base.OnFormClosing(e);
+    }
+
+    private static TableCellColorMappingMode ParseTableCellColorMappingMode(JsonElement root)
+    {
+        if (!root.TryGetProperty("tableCellColorMappingMode", out var modeElement))
+        {
+            return TableCellColorMappingMode.Background;
+        }
+
+        if (modeElement.ValueKind == JsonValueKind.String
+            && Enum.TryParse<TableCellColorMappingMode>(
+                modeElement.GetString(),
+                ignoreCase: true,
+                out var parsedFromString))
+        {
+            return parsedFromString;
+        }
+
+        if (modeElement.ValueKind == JsonValueKind.Number
+            && modeElement.TryGetInt32(out var parsedValue)
+            && Enum.IsDefined(typeof(TableCellColorMappingMode), parsedValue))
+        {
+            return (TableCellColorMappingMode)parsedValue;
+        }
+
+        return TableCellColorMappingMode.Background;
+    }
+
+    private TableCellColorMappingMode GetSelectedTableCellColorMappingMode()
+    {
+        return comboBoxTableCellColorMapping.SelectedIndex == 1
+            ? TableCellColorMappingMode.Text
+            : TableCellColorMappingMode.Background;
+    }
+
+    private void SetSelectedTableCellColorMappingMode(TableCellColorMappingMode mode)
+    {
+        comboBoxTableCellColorMapping.SelectedIndex = mode == TableCellColorMappingMode.Text ? 1 : 0;
+    }
+
+    private void ComboBoxTableCellColorMapping_SelectedIndexChanged(object sender, EventArgs e)
+    {
+        if (_isLoadingConfig)
+        {
+            return;
+        }
+
+        SaveConfig();
+    }
+
+    private async Task TryHydratePrivateApiSettingsFromEmbeddedNotionAsync(string parentPageId, CancellationToken cancellationToken)
+    {
+        var configUpdated = false;
+
+        if (_webViewReady && webViewNotion.CoreWebView2 is not null)
+        {
+            try
+            {
+                var cookies = await webViewNotion.CoreWebView2.CookieManager.GetCookiesAsync("https://www.notion.so/");
+                var tokenCookie = cookies.FirstOrDefault(cookie =>
+                    string.Equals(cookie.Name, "token_v2", StringComparison.OrdinalIgnoreCase));
+
+                var tokenFromCookie = tokenCookie?.Value?.Trim();
+                if (!string.IsNullOrWhiteSpace(tokenFromCookie)
+                    && !string.Equals(_privateApiTokenV2, tokenFromCookie, StringComparison.Ordinal))
+                {
+                    _privateApiTokenV2 = tokenFromCookie;
+                    configUpdated = true;
+                    DiagnosticLogger.Info($"已从内嵌 Notion 登录态读取 token_v2（尾号: {MaskSecret(_privateApiTokenV2)}）");
+                }
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLogger.Warn($"从 WebView2 读取 token_v2 失败: {ex.Message}");
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(_privateApiTokenV2)
+            && !string.IsNullOrWhiteSpace(parentPageId))
+        {
+            try
+            {
+                var resolvedSpaceId = await _notionApiClient.TryResolvePrivateSpaceIdFromPageAsync(
+                    parentPageId,
+                    _privateApiTokenV2,
+                    cancellationToken);
+                if (!string.IsNullOrWhiteSpace(resolvedSpaceId)
+                    && !string.Equals(_privateApiSpaceId, resolvedSpaceId, StringComparison.OrdinalIgnoreCase))
+                {
+                    _privateApiSpaceId = resolvedSpaceId;
+                    configUpdated = true;
+                    DiagnosticLogger.Info($"已根据页面自动解析 space_id（尾号: {MaskSecret(_privateApiSpaceId)}）");
+                }
+                else if (string.IsNullOrWhiteSpace(_privateApiSpaceId))
+                {
+                    DiagnosticLogger.Warn("已读取 token_v2，但未能自动解析 space_id；整格背景色将不可用。");
+                }
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLogger.Warn($"自动解析 space_id 失败: {ex.Message}");
+            }
+        }
+
+        if (configUpdated && !_isLoadingConfig)
+        {
+            SaveConfig();
+        }
+    }
+
+    private static string MaskSecret(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var trimmed = value.Trim();
+        return trimmed.Length <= 6
+            ? "******"
+            : new string('*', trimmed.Length - 6) + trimmed[^6..];
+    }
+
+    private SyncOptions ResolveEffectiveSyncOptions(SyncOptions requestedOptions)
+    {
+        if (requestedOptions.TableCellColorMappingMode != TableCellColorMappingMode.Background)
+        {
+            return requestedOptions;
+        }
+
+        var hasPrivateToken = !string.IsNullOrWhiteSpace(_privateApiTokenV2);
+        var hasPrivateSpaceId = !string.IsNullOrWhiteSpace(_privateApiSpaceId);
+        if (hasPrivateToken && hasPrivateSpaceId)
+        {
+            return requestedOptions;
+        }
+
+        DiagnosticLogger.Warn("当前选择“映射为单元格背景”，但私有凭据不完整，已临时回退为“映射为字体颜色”。");
+        return requestedOptions with
+        {
+            TableCellColorMappingMode = TableCellColorMappingMode.Text
+        };
+    }
+
+    private void ConfigureNotionApiClientPrivateSettings()
+    {
+        _notionApiClient.PrivateApiTokenV2 = _privateApiTokenV2;
+        _notionApiClient.PrivateApiSpaceId = _privateApiSpaceId;
+        _notionApiClient.PrivateApiUserId = _privateApiUserId;
     }
 }

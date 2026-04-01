@@ -4,7 +4,12 @@ public interface INotionApiClient
 {
     Task<string> CreateChildPageAsync(string parentPageId, string title, string token, CancellationToken cancellationToken);
 
-    Task AppendBlocksAsync(string pageId, IReadOnlyList<NotionBlockInput> blocks, string token, CancellationToken cancellationToken);
+    Task AppendBlocksAsync(
+        string pageId,
+        IReadOnlyList<NotionBlockInput> blocks,
+        string token,
+        OneNoteToNotion.Domain.TableCellColorMappingMode tableCellColorMappingMode,
+        CancellationToken cancellationToken);
 
     Task ArchivePagesAsync(IEnumerable<string> pageIds, string token, CancellationToken cancellationToken);
 

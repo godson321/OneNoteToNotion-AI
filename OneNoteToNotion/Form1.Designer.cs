@@ -45,6 +45,8 @@ partial class Form1
         labelEmbeddedHint = new Label();
         webViewNotion = new Microsoft.Web.WebView2.WinForms.WebView2();
         panelConfig = new Panel();
+        comboBoxTableCellColorMapping = new ComboBox();
+        labelTableCellColorMapping = new Label();
         textBoxMoveParentId = new TextBox();
         labelMoveParent = new Label();
         checkBoxDryRun = new CheckBox();
@@ -182,9 +184,9 @@ partial class Form1
         panelRight.Controls.Add(labelEmbeddedHint);
         panelRight.Controls.Add(webViewNotion);
         panelRight.Dock = DockStyle.Fill;
-        panelRight.Location = new Point(0, 130);
+        panelRight.Location = new Point(0, 168);
         panelRight.Name = "panelRight";
-        panelRight.Size = new Size(944, 638);
+        panelRight.Size = new Size(944, 600);
         panelRight.TabIndex = 1;
         // 
         // labelEmbeddedHint
@@ -192,7 +194,7 @@ partial class Form1
         labelEmbeddedHint.Dock = DockStyle.Fill;
         labelEmbeddedHint.Location = new Point(0, 0);
         labelEmbeddedHint.Name = "labelEmbeddedHint";
-        labelEmbeddedHint.Size = new Size(942, 636);
+        labelEmbeddedHint.Size = new Size(942, 598);
         labelEmbeddedHint.TabIndex = 1;
         labelEmbeddedHint.Text = "Notion 内嵌加载中...";
         labelEmbeddedHint.TextAlign = ContentAlignment.MiddleCenter;
@@ -205,12 +207,14 @@ partial class Form1
         webViewNotion.Dock = DockStyle.Fill;
         webViewNotion.Location = new Point(0, 0);
         webViewNotion.Name = "webViewNotion";
-        webViewNotion.Size = new Size(942, 636);
+        webViewNotion.Size = new Size(942, 598);
         webViewNotion.TabIndex = 0;
         webViewNotion.ZoomFactor = 1D;
         // 
         // panelConfig
         // 
+        panelConfig.Controls.Add(comboBoxTableCellColorMapping);
+        panelConfig.Controls.Add(labelTableCellColorMapping);
         panelConfig.Controls.Add(numericRetryCount);
         panelConfig.Controls.Add(labelRetryCount);
         panelConfig.Controls.Add(textBoxMoveParentId);
@@ -224,8 +228,28 @@ partial class Form1
         panelConfig.Dock = DockStyle.Top;
         panelConfig.Location = new Point(0, 0);
         panelConfig.Name = "panelConfig";
-        panelConfig.Size = new Size(944, 130);
+        panelConfig.Size = new Size(944, 168);
         panelConfig.TabIndex = 0;
+        // 
+        // comboBoxTableCellColorMapping
+        // 
+        comboBoxTableCellColorMapping.DropDownStyle = ComboBoxStyle.DropDownList;
+        comboBoxTableCellColorMapping.FormattingEnabled = true;
+        comboBoxTableCellColorMapping.Items.AddRange(new object[] { "映射为单元格背景", "映射为字体颜色" });
+        comboBoxTableCellColorMapping.Location = new Point(159, 129);
+        comboBoxTableCellColorMapping.Name = "comboBoxTableCellColorMapping";
+        comboBoxTableCellColorMapping.Size = new Size(202, 28);
+        comboBoxTableCellColorMapping.TabIndex = 11;
+        comboBoxTableCellColorMapping.SelectedIndexChanged += ComboBoxTableCellColorMapping_SelectedIndexChanged;
+        // 
+        // labelTableCellColorMapping
+        // 
+        labelTableCellColorMapping.AutoSize = true;
+        labelTableCellColorMapping.Location = new Point(14, 132);
+        labelTableCellColorMapping.Name = "labelTableCellColorMapping";
+        labelTableCellColorMapping.Size = new Size(122, 20);
+        labelTableCellColorMapping.TabIndex = 10;
+        labelTableCellColorMapping.Text = "单元格颜色映射：";
         // 
         // textBoxMoveParentId
         // 
@@ -393,4 +417,6 @@ partial class Form1
     private Button buttonTokenHelp;
     private NumericUpDown numericRetryCount;
     private Label labelRetryCount;
+    private ComboBox comboBoxTableCellColorMapping;
+    private Label labelTableCellColorMapping;
 }

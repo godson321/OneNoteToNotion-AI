@@ -204,7 +204,9 @@ public sealed class NotionSyncOrchestrator
                     await ProcessAttachmentsAsync(semanticDocument, options.NotionToken, cancellationToken);
                 }
 
-                var notionBlocks = _blockMapper.Map(semanticDocument);
+                var notionBlocks = _blockMapper.Map(
+                    semanticDocument,
+                    options.TableCellColorMappingMode);
 
                 DumpDiagnostics(notionPageTitle, pageXml, semanticDocument);
 
@@ -288,6 +290,7 @@ public sealed class NotionSyncOrchestrator
                 createdPageId,
                 notionBlocks,
                 options.NotionToken,
+                options.TableCellColorMappingMode,
                 cancellationToken);
             DiagnosticLogger.Info($"[{DateTime.Now:HH:mm:ss}] [写入完成] 「{pageTitle}」 {notionBlocks.Count} 个内容块已写入");
         }

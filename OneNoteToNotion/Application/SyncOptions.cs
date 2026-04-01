@@ -3,4 +3,6 @@
 public sealed record SyncOptions(
     string NotionToken,
     string ParentPageId,
-    bool DryRun);
+    bool DryRun,
+    OneNoteToNotion.Domain.TableCellColorMappingMode TableCellColorMappingMode =
+        OneNoteToNotion.Domain.TableCellColorMappingMode.Background);

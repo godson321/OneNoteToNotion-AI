@@ -142,6 +142,12 @@ public sealed class NotionStyleMappingRules
         return FindNearestNotionColor(normalized);
     }
 
+    public string MapBackgroundColor(string? htmlColor)
+    {
+        var mapped = MapColor(htmlColor);
+        return mapped == "default" ? "default" : $"{mapped}_background";
+    }
+
     private static string? NormalizeColor(string color)
     {
         // Handle rgb(r,g,b) and rgba(r,g,b,a)
